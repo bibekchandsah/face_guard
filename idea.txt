@@ -1,0 +1,59 @@
+
+
+## 🎯 Final Refined Master Prompt
+
+*"Build a Python-based GUI application with the following features:*
+
+### 1. **Face Detection & User Registration**
+
+* On the **first startup**, capture and register the user’s face.
+* Save the face encoding so the system remembers the user across future sessions.
+* Continuously monitor webcam input to detect faces in real-time.
+* If a **new/unknown face** (not the registered user) is detected, trigger the brightness confirmation process.
+
+### 2. **Brightness Control**
+
+* When a new face is detected, brightness should only reduce to **25%** after confirmation.
+* Provide an **override hotkey** (e.g., `Ctrl+Shift+R`) to instantly restore brightness to normal.
+
+### 3. **Gesture-Based Confirmation**
+
+* **Nod Up & Down Twice (Yes gesture)** → Confirm brightness reduction.
+* **Shake Left & Right (No gesture)** → Cancel brightness reduction.
+* Use **Mediapipe (face landmarks)** to track head movements.
+
+### 4. **Visual Indicators & Notifications**
+
+* Show a **floating notification** only when an event occurs (e.g., “Unknown face detected”, “Waiting for gesture confirmation”, “Brightness reduced”).
+* Display a **green icon** when nod detected (confirmation) and a **red icon** when shake detected (cancellation).
+
+### 5. **Logs**
+
+* Maintain **real-time logs** in the GUI (e.g., “User face recognized”, “Unknown face detected”, “Gesture = Nod”, “Brightness reduced to 25%”).
+
+### 6. **Technical Details**
+
+* Use **OpenCV** for video capture and face recognition.
+* Use **Mediapipe** for gesture/head movement detection.
+* Use **screen-brightness-control** (Windows/Linux) or `pyobjc` (macOS) for brightness adjustment.
+* Lightweight, real-time performance.
+* GUI should be simple and floating (Tkinter/PyQt).
+
+
+
+
+
+
+
+echo "# face_guard" >> README.md
+git init
+git add .
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/bibekchandsah/face_guard.git
+git push -u origin main
+
+
+git remote add origin https://github.com/bibekchandsah/face_guard.git
+git branch -M main
+git push -u origin main
