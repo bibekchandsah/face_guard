@@ -135,6 +135,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QWidget
 
 class Toast(QWidget):
+    # Signal for thread-safe toast display
+    toast_signal = Signal(str, str, int)
+    
     def __init__(self, parent=None):
         super().__init__(parent, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -161,13 +164,25 @@ class Toast(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.hide)
         self.timer.setSingleShot(True)
+        
+        # Connect signal to implementation
+        self.toast_signal.connect(self._show_toast_impl)
 
     def show_toast(self, text, color=None, duration_ms=None):
-        # Use QTimer.singleShot to ensure thread safety
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self._show_toast_impl(text, color, duration_ms))
+        # Use Qt signal for thread-safe toast display
+        print(f"DEBUG: Toast requested: {text} (color: {color})")  # Debug log
+        
+        # Use default duration if not provided
+        if duration_ms is None:
+            settings = load_settings()
+            duration_ms = int(settings.get("status_display_duration", 5.0) * 1000)
+        
+        # Emit signal to show toast (thread-safe)
+        color_str = color if color else ""
+        self.toast_signal.emit(text, color_str, duration_ms)
     
-    def _show_toast_impl(self, text, color, duration_ms=None):
+    def _show_toast_impl(self, text, color, duration_ms):
+        print(f"DEBUG: Toast implementation called: {text}")  # Debug log
         self.label.setText(text)
         if color == "green":
             self.icon.setStyleSheet("border-radius: 6px; background: #22c55e;")
@@ -182,7 +197,13 @@ class Toast(QWidget):
         screen = QApplication.primaryScreen().availableGeometry()
         self.adjustSize()
         self.move(screen.right() - self.width() - 24, screen.top() + 24)
+        
+        # Ensure the toast is properly displayed and stays on top
         self.show()
+        self.raise_()
+        self.activateWindow()
+        self.repaint()  # Force immediate repaint
+        print(f"DEBUG: Toast widget shown at position ({self.x()}, {self.y()})")  # Debug log
         
         # Use custom duration if provided, or get from settings (5 seconds = 5000ms)
         if duration_ms is None:
@@ -191,6 +212,7 @@ class Toast(QWidget):
             duration_ms = int(settings.get("status_display_duration", 5.0) * 1000)
         
         self.timer.start(duration_ms)
+        print(f"DEBUG: Toast timer started for {duration_ms}ms")  # Debug log
 
 # ------------------- Logs Window (on demand) -------------------
 
@@ -1482,13 +1504,15 @@ class VisionWorker(threading.Thread):
                     self.restore_brightness()
                     self.brightness_dimmed_for_absence = False
                     self.owner_absent_start = None
-                    self.on_toast("Owner detected — Brightness restored", "green")
+                    self.on_toast("✅ Owner returned — System restored", "green")
             else:
                 # Owner is not present
                 if self.owner_absent_start is None:
                     # Owner just left
                     self.owner_absent_start = now
                     log("Owner left camera view")
+                    log("DEBUG: Calling toast for owner left")
+                    self.on_toast("⚠️ Owner left camera view — Screen will dim in 3 seconds", "orange")
                 elif not self.brightness_dimmed_for_absence and (now - self.owner_absent_start) > 3.0:
                     # Owner has been absent for 3 seconds, store current brightness then dim to 0
                     log("Owner absent for 3 seconds → storing current brightness and dimming to 0%")
@@ -1508,8 +1532,9 @@ class VisionWorker(threading.Thread):
                     self.awaiting_gesture = True
                     self.gesture_deadline = now + 6.0  # 6 seconds to confirm
                     log("Unknown face detected → awaiting gesture confirmation.")
+                    log("DEBUG: Calling toast for unknown face detected")
                     self.on_unknown_face()
-                    self.on_toast("Unknown face detected — Nod twice to dim, Shake to cancel", None)
+                    self.on_toast("🚨 UNKNOWN FACE DETECTED — Nod twice to dim, Shake to cancel", "red")
 
             # If awaiting gesture, evaluate nod/shake (but not during gesture test)
             if self.awaiting_gesture and not self.gesture_test_mode:
@@ -1518,20 +1543,24 @@ class VisionWorker(threading.Thread):
                     self.awaiting_gesture = False
                     self.gesture_confirmed = True
                     self.on_nod()
-                    self.on_toast("Nod detected — Dimming to 25%", "green")
+                    self.on_toast("✅ Nod confirmed — Dimming screen for security", "green")
                     self.set_brightness(25)
                     self.reduced = True
                 elif is_shake:
                     self.awaiting_gesture = False
                     self.gesture_confirmed = False
                     self.on_shake()
-                    self.on_toast("Shake detected — Cancelled", "red")
+                    self.on_toast("❌ Shake detected — Unknown face access denied", "red")
 
+                # Warning when deadline is approaching (2 seconds before timeout)
+                if self.awaiting_gesture and (self.gesture_deadline - now) <= 2.0 and (self.gesture_deadline - now) > 1.8:
+                    self.on_toast("⏰ 2 seconds left — Nod to confirm or Shake to cancel", "orange")
+                
                 # Timeout without gesture → cancel
                 if now > self.gesture_deadline and self.awaiting_gesture:
                     self.awaiting_gesture = False
                     log("Gesture confirmation timed out — Cancelled.")
-                    self.on_toast("Timeout — Cancelled", "red")
+                    self.on_toast("⏰ Timeout — Unknown face access denied", "red")
 
             time.sleep(0.01)
 
@@ -1729,6 +1758,9 @@ class App(QApplication):
         # Start main monitoring (independent of preview window)
         self.worker.start()
         log("🛡️ Main monitoring thread started (independent of camera preview)")
+        
+        # Show startup notification
+        self.toast.show_toast("🛡️ FaceGuard Active — Monitoring for security", "green")
 
         # Global hotkeys
         keyboard.add_hotkey("ctrl+shift+r", self.restore_brightness)
