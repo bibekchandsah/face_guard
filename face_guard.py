@@ -27,11 +27,15 @@ from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QThread
 from PySide6.QtGui import QIcon, QAction, QKeySequence, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QSystemTrayIcon, QMenu,
-    QTextEdit, QMainWindow, QDockWidget, QHBoxLayout, QPushButton
+    QTextEdit, QMainWindow, QDockWidget, QHBoxLayout, QPushButton, QCheckBox
 )
 
 # Global hotkeys
 import keyboard
+
+# Windows lock screen functionality
+import ctypes
+import ctypes.wintypes
 
 # Use current script directory instead of user home
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,13 +56,52 @@ LOG_FILE_PATH = os.path.join(LOGS_DIR, f"face_guard_{time.strftime('%Y%m%d')}.lo
 
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=4)
 
 def load_json(path, default=None):
     if not os.path.exists(path):
         return default
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+# Default settings
+DEFAULT_SETTINGS = {
+    "face_recognition_sensitivity": 0.48,  # Lower = more strict, Higher = more lenient
+    "auto_lock_enabled": False,
+    "status_display_duration": 5.0,  # seconds
+    "brightness_before_absence": 100,  # Store original brightness
+    "performance_mode": True,
+    "gesture_thresholds": {
+        "nod_threshold": 12.0,
+        "shake_threshold": 15.0
+    },
+    "current_brightness": 100,  # Current system brightness
+    "brightness_restored": True  # Track if brightness was restored
+}
+
+def load_settings():
+    """Load application settings with defaults"""
+    settings = load_json(SETTINGS_PATH, DEFAULT_SETTINGS.copy())
+    # Ensure all default keys exist
+    for key, value in DEFAULT_SETTINGS.items():
+        if key not in settings:
+            settings[key] = value
+    return settings
+
+def save_settings(settings):
+    """Save application settings"""
+    save_json(SETTINGS_PATH, settings)
+    log(f"Settings saved: {SETTINGS_PATH}")
+
+def lock_windows_screen():
+    """Lock the Windows screen"""
+    try:
+        ctypes.windll.user32.LockWorkStation()
+        log("🔒 Windows screen locked")
+        return True
+    except Exception as e:
+        log(f"Failed to lock screen: {e}")
+        return False
 
 def cosine_similarity(a, b, eps=1e-8):
     a = np.array(a); b = np.array(b)
@@ -119,17 +162,19 @@ class Toast(QWidget):
         self.timer.timeout.connect(self.hide)
         self.timer.setSingleShot(True)
 
-    def show_toast(self, text, color=None):
+    def show_toast(self, text, color=None, duration_ms=None):
         # Use QTimer.singleShot to ensure thread safety
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: self._show_toast_impl(text, color))
+        QTimer.singleShot(0, lambda: self._show_toast_impl(text, color, duration_ms))
     
-    def _show_toast_impl(self, text, color):
+    def _show_toast_impl(self, text, color, duration_ms=None):
         self.label.setText(text)
         if color == "green":
             self.icon.setStyleSheet("border-radius: 6px; background: #22c55e;")
         elif color == "red":
             self.icon.setStyleSheet("border-radius: 6px; background: #ef4444;")
+        elif color == "orange":
+            self.icon.setStyleSheet("border-radius: 6px; background: #ff9800;")
         else:
             self.icon.setStyleSheet("border-radius: 6px; background: transparent;")
 
@@ -138,7 +183,14 @@ class Toast(QWidget):
         self.adjustSize()
         self.move(screen.right() - self.width() - 24, screen.top() + 24)
         self.show()
-        self.timer.start(self.duration_ms)
+        
+        # Use custom duration if provided, or get from settings (5 seconds = 5000ms)
+        if duration_ms is None:
+            # Load settings to get the configured duration
+            settings = load_settings()
+            duration_ms = int(settings.get("status_display_duration", 5.0) * 1000)
+        
+        self.timer.start(duration_ms)
 
 # ------------------- Logs Window (on demand) -------------------
 
@@ -788,18 +840,28 @@ class VisionWorker(threading.Thread):
         self.gesture_deadline = 0
         self.gesture_confirmed = False
 
+        # Load settings
+        self.settings = load_settings()
+        
         # Brightness state
         self.normal_brightness = self._get_current_brightness()
         self.reduced = False
         self.owner_absent_start = None
         self.brightness_dimmed_for_absence = False
         
+        # Status display timing
+        self.last_status_display = 0
+        self.status_display_duration = self.settings.get("status_display_duration", 5.0)
+        
+        # Auto-lock functionality
+        self.auto_lock_enabled = self.settings.get("auto_lock_enabled", False)
+        
         # Face detection state
         self.current_frame = None
         self.face_boxes = []
         
         # Face recognition settings
-        self.face_recognition_tolerance = 0.48  # Default 75% sensitivity (0.48 tolerance)
+        self.face_recognition_tolerance = self.settings.get("face_recognition_sensitivity", 0.48)
         
         # Optimized face detection for real-time preview
         if HAS_FACE_REC:
@@ -952,22 +1014,73 @@ class VisionWorker(threading.Thread):
 
     def _get_current_brightness(self):
         try:
-            return sbc.get_brightness(display=0)
+            brightness = sbc.get_brightness(display=0)
+            # sbc.get_brightness returns a list, get the first element
+            return brightness[0] if isinstance(brightness, list) and brightness else brightness
         except Exception:
             return 100
 
     def set_brightness(self, val):
         val = int(max(0, min(100, val)))
         try:
-            sbc.set_brightness(val)
+            sbc.set_brightness(val, display=0)
             self.on_brightness_change(val)
+            
+            # Update settings with current brightness
+            self.settings["current_brightness"] = val
+            save_settings(self.settings)
+            
             log(f"Brightness set to {val}%.")
         except Exception as e:
             log(f"Brightness change failed: {e}")
 
+    def store_current_brightness(self):
+        """Store current brightness before making changes"""
+        try:
+            current = self._get_current_brightness()
+            # Ensure current is an integer
+            current = int(current) if current is not None else 100
+            
+            # Only store if we haven't already stored it (prevent overwriting the original)
+            if self.settings.get("brightness_restored", True):
+                self.settings["brightness_before_absence"] = current
+                self.settings["brightness_restored"] = False
+                save_settings(self.settings)
+                log(f"Stored original brightness: {current}% (will restore to this level when owner returns)")
+            else:
+                stored = self.settings.get('brightness_before_absence', 100)
+                log(f"Brightness already stored at {stored}%, not overwriting")
+            self.normal_brightness = current
+        except Exception as e:
+            log(f"Failed to store brightness: {e}")
+
     def restore_brightness(self):
-        self.set_brightness(self.normal_brightness if isinstance(self.normal_brightness, int) else 100)
-        self.reduced = False
+        """Restore brightness to the stored value before absence"""
+        try:
+            stored_brightness = self.settings.get("brightness_before_absence", 100)
+            current_brightness = self._get_current_brightness()
+            
+            # Handle case where stored_brightness might be a list (from previous versions)
+            if isinstance(stored_brightness, list) and stored_brightness:
+                stored_brightness = stored_brightness[0]
+            
+            # Ensure both values are integers
+            stored_brightness = int(stored_brightness) if stored_brightness is not None else 100
+            current_brightness = int(current_brightness) if current_brightness is not None else 100
+            
+            # Always restore if we haven't already restored (brightness_restored = False means we need to restore)
+            if not self.settings.get("brightness_restored", True):
+                self.set_brightness(stored_brightness)
+                self.reduced = False
+                self.settings["brightness_restored"] = True
+                # Also fix the stored value to be an integer for future use
+                self.settings["brightness_before_absence"] = stored_brightness
+                save_settings(self.settings)
+                log(f"Brightness restored from {current_brightness}% to {stored_brightness}%")
+            else:
+                log(f"Brightness already restored to {stored_brightness}%")
+        except Exception as e:
+            log(f"Failed to restore brightness: {e}")
     
     # ---------- Unknown face logging ----------
     
@@ -1377,8 +1490,9 @@ class VisionWorker(threading.Thread):
                     self.owner_absent_start = now
                     log("Owner left camera view")
                 elif not self.brightness_dimmed_for_absence and (now - self.owner_absent_start) > 3.0:
-                    # Owner has been absent for 3 seconds, dim brightness to 0
-                    log("Owner absent for 3 seconds → dimming brightness to 0%")
+                    # Owner has been absent for 3 seconds, store current brightness then dim to 0
+                    log("Owner absent for 3 seconds → storing current brightness and dimming to 0%")
+                    self.store_current_brightness()  # Store current brightness before dimming
                     self.set_brightness(0)
                     self.brightness_dimmed_for_absence = True
                     self.on_toast("Owner absent — Brightness dimmed to 0%", "red")
@@ -1423,6 +1537,117 @@ class VisionWorker(threading.Thread):
 
         self.cap.release()
 
+# ------------------- Settings Window -------------------
+
+class SettingsWindow(QMainWindow):
+    def __init__(self, worker):
+        super().__init__()
+        self.worker = worker
+        self.setWindowTitle("FaceGuard • Settings")
+        self.setFixedSize(400, 300)
+        self.setWindowFlags(Qt.Window)
+        
+        # Dark theme styling
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+                font-size: 12px;
+                padding: 5px;
+            }
+            QCheckBox {
+                color: #ffffff;
+                font-size: 12px;
+                padding: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #404040;
+                border: 2px solid #606060;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #0078d4;
+                border: 2px solid #0078d4;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #606060;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #303030;
+            }
+        """)
+        
+        # Central widget and layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Title
+        title = QLabel("FaceGuard Settings")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
+        layout.addWidget(title)
+        
+        # Auto-lock checkbox
+        self.auto_lock_checkbox = QCheckBox("🔒 Auto-lock screen when owner is absent")
+        self.auto_lock_checkbox.setToolTip("Automatically lock Windows screen when owner face is not detected")
+        layout.addWidget(self.auto_lock_checkbox)
+        
+        # Performance mode checkbox
+        self.performance_checkbox = QCheckBox("⚡ Performance mode (faster detection)")
+        self.performance_checkbox.setToolTip("Enable optimized detection for better performance")
+        layout.addWidget(self.performance_checkbox)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.save_button = QPushButton("💾 Save Settings")
+        self.save_button.clicked.connect(self.save_settings)
+        
+        self.cancel_button = QPushButton("❌ Cancel")
+        self.cancel_button.clicked.connect(self.close)
+        
+        button_layout.addWidget(self.save_button)
+        button_layout.addWidget(self.cancel_button)
+        
+        layout.addStretch()
+        layout.addLayout(button_layout)
+        
+        # Load current settings
+        self.load_current_settings()
+    
+    def load_current_settings(self):
+        """Load current settings into the UI"""
+        settings = self.worker.settings
+        self.auto_lock_checkbox.setChecked(settings.get("auto_lock_enabled", False))
+        self.performance_checkbox.setChecked(settings.get("performance_mode", True))
+    
+    def save_settings(self):
+        """Save settings and close window"""
+        self.worker.settings["auto_lock_enabled"] = self.auto_lock_checkbox.isChecked()
+        self.worker.settings["performance_mode"] = self.performance_checkbox.isChecked()
+        save_settings(self.worker.settings)
+        
+        log(f"Settings saved - Auto-lock: {self.auto_lock_checkbox.isChecked()}, Performance: {self.performance_checkbox.isChecked()}")
+        self.close()
+
 # ---------------------- Main Application ----------------------
 
 class App(QApplication):
@@ -1455,6 +1680,7 @@ class App(QApplication):
         self.action_show_logs = QAction("📋 Show Logs")
         self.action_show_camera = QAction("�t Show Camera Preview")
         self.action_restore = QAction("💡 Restore Brightness")
+        self.action_settings = QAction("⚙️ Settings")
         self.action_status = QAction("ℹ️ Status")
         self.action_exit = QAction("❌ Exit")
         
@@ -1463,6 +1689,7 @@ class App(QApplication):
         self.menu.addAction(self.action_show_logs)
         self.menu.addAction(self.action_show_camera)
         self.menu.addAction(self.action_restore)
+        self.menu.addAction(self.action_settings)
         self.menu.addSeparator()
         self.menu.addAction(self.action_exit)
 
@@ -1472,10 +1699,12 @@ class App(QApplication):
         self.toast = Toast()
         self.logs = LogWindow()
         self.camera_preview = CameraPreview()
+        self.settings_window = None  # Will be created when needed
 
         self.action_show_logs.triggered.connect(self.logs.show)
         self.action_show_camera.triggered.connect(self.camera_preview.show)
         self.action_restore.triggered.connect(self.restore_brightness)
+        self.action_settings.triggered.connect(self.show_settings)
         self.action_status.triggered.connect(self.show_status)
         self.action_exit.triggered.connect(self.quit_all)
         
@@ -1532,8 +1761,22 @@ class App(QApplication):
         gesture_status = "⏳ Waiting for gesture" if self.worker.awaiting_gesture else "👁️ Monitoring"
         
         status_msg = f"Owner: {owner_status} | Brightness: {brightness_status} | Status: {gesture_status}"
-        self.toast.show_toast(status_msg, None)
+        # Use 5 seconds (5000ms) for status display as configured in settings
+        settings = load_settings()
+        duration_ms = int(settings.get("status_display_duration", 5.0) * 1000)
+        self.toast.show_toast(status_msg, None, duration_ms)
         log(f"Status check: {status_msg}")
+    
+    def show_settings(self):
+        """Show settings window"""
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self.worker)
+        
+        if self.settings_window.isVisible():
+            self.settings_window.raise_()
+            self.settings_window.activateWindow()
+        else:
+            self.settings_window.show()
     
     def view_unknown_faces(self):
         """Open folder containing unknown face images"""
