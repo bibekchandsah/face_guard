@@ -51,6 +51,7 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 
 ENCODING_PATH = os.path.join(APP_DIR, "user_face_encoding.json")
 TRUSTED_FACES_PATH = os.path.join(APP_DIR, "trusted_faces.json")
+SECURITY_KEY_PATH = os.path.join(APP_DIR, "security_key.json")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 LOG_FILE_PATH = os.path.join(LOGS_DIR, f"face_guard_{time.strftime('%Y%m%d')}.log")
 
@@ -80,7 +81,13 @@ DEFAULT_SETTINGS = {
         "shake_threshold": 15.0
     },
     "current_brightness": 100,  # Current system brightness
-    "brightness_restored": True  # Track if brightness was restored
+    "brightness_restored": True,  # Track if brightness was restored
+    "security_key_enabled": True,  # Enable security key for trusted users
+    "security_key_timeout": 600,  # 10 minutes in seconds
+    "security_key_hash": "",  # Hashed security key (empty = not set)
+    "trusted_session_active": False,  # Track if trusted user session is active
+    "trusted_session_start": 0,  # Timestamp when trusted session started
+    "trusted_user_name": ""  # Name of current trusted user
 }
 
 def load_settings():
@@ -96,6 +103,174 @@ def save_settings(settings):
     """Save application settings"""
     save_json(SETTINGS_PATH, settings)
     log(f"Settings saved: {SETTINGS_PATH}")
+
+# ------------------------ Security Key Management ------------------------
+
+def hash_security_key(key):
+    """Hash a security key using SHA-256"""
+    import hashlib
+    return hashlib.sha256(key.encode('utf-8')).hexdigest()
+
+def load_security_key_data():
+    """Load security key data from file"""
+    default_data = {
+        "security_key_hash": "",
+        "security_key_enabled": True,
+        "security_key_timeout": 600,  # 10 minutes
+        "trusted_session_active": False,
+        "trusted_session_start": 0,
+        "trusted_user_name": "",
+        "last_updated": "",
+        "creation_date": ""
+    }
+    return load_json(SECURITY_KEY_PATH, default_data)
+
+def save_security_key_data(data):
+    """Save security key data to file"""
+    data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_json(SECURITY_KEY_PATH, data)
+    log(f"Security key data saved: {SECURITY_KEY_PATH}")
+
+def set_security_key(key, timeout_minutes=10):
+    """Set a new security key with specified timeout"""
+    if not key or len(key.strip()) < 4:
+        return False, "Security key must be at least 4 characters long"
+    
+    try:
+        data = load_security_key_data()
+        data["security_key_hash"] = hash_security_key(key.strip())
+        data["security_key_enabled"] = True
+        data["security_key_timeout"] = timeout_minutes * 60  # Convert to seconds
+        data["trusted_session_active"] = False
+        data["trusted_session_start"] = 0
+        data["trusted_user_name"] = ""
+        
+        if not data["creation_date"]:
+            data["creation_date"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        save_security_key_data(data)
+        log(f"Security key set with {timeout_minutes} minute timeout")
+        return True, "Security key set successfully"
+        
+    except Exception as e:
+        log(f"Error setting security key: {e}")
+        return False, f"Failed to set security key: {str(e)}"
+
+def verify_security_key(key):
+    """Verify a security key against stored hash"""
+    try:
+        data = load_security_key_data()
+        
+        if not data["security_key_enabled"] or not data["security_key_hash"]:
+            return False, "Security key not configured"
+        
+        key_hash = hash_security_key(key.strip())
+        if key_hash == data["security_key_hash"]:
+            return True, "Security key verified"
+        else:
+            return False, "Invalid security key"
+            
+    except Exception as e:
+        log(f"Error verifying security key: {e}")
+        return False, f"Verification error: {str(e)}"
+
+def start_trusted_session(user_name="Trusted User"):
+    """Start a trusted user session"""
+    try:
+        data = load_security_key_data()
+        data["trusted_session_active"] = True
+        data["trusted_session_start"] = time.time()
+        data["trusted_user_name"] = user_name
+        save_security_key_data(data)
+        
+        timeout_minutes = data["security_key_timeout"] // 60
+        log(f"Trusted session started for '{user_name}' (timeout: {timeout_minutes} minutes)")
+        return True, f"Trusted session started for {timeout_minutes} minutes"
+        
+    except Exception as e:
+        log(f"Error starting trusted session: {e}")
+        return False, f"Failed to start session: {str(e)}"
+
+def end_trusted_session():
+    """End the current trusted user session"""
+    try:
+        data = load_security_key_data()
+        user_name = data.get("trusted_user_name", "Unknown")
+        data["trusted_session_active"] = False
+        data["trusted_session_start"] = 0
+        data["trusted_user_name"] = ""
+        save_security_key_data(data)
+        
+        log(f"Trusted session ended for '{user_name}'")
+        return True, "Trusted session ended"
+        
+    except Exception as e:
+        log(f"Error ending trusted session: {e}")
+        return False, f"Failed to end session: {str(e)}"
+
+def check_trusted_session_timeout():
+    """Check if trusted session has timed out"""
+    try:
+        data = load_security_key_data()
+        
+        if not data["trusted_session_active"]:
+            return False, "No active session"
+        
+        current_time = time.time()
+        session_start = data["trusted_session_start"]
+        timeout_seconds = data["security_key_timeout"]
+        
+        if current_time - session_start > timeout_seconds:
+            # Session timed out
+            end_trusted_session()
+            return True, "Session timed out"
+        else:
+            remaining_seconds = timeout_seconds - (current_time - session_start)
+            remaining_minutes = int(remaining_seconds // 60)
+            return False, f"Session active ({remaining_minutes} minutes remaining)"
+            
+    except Exception as e:
+        log(f"Error checking session timeout: {e}")
+        return True, f"Session check error: {str(e)}"
+
+def get_security_key_status():
+    """Get current security key status"""
+    try:
+        data = load_security_key_data()
+        
+        status = {
+            "enabled": data["security_key_enabled"],
+            "configured": bool(data["security_key_hash"]),
+            "timeout_minutes": data["security_key_timeout"] // 60,
+            "session_active": data["trusted_session_active"],
+            "trusted_user": data["trusted_user_name"],
+            "creation_date": data.get("creation_date", "Unknown"),
+            "last_updated": data.get("last_updated", "Unknown")
+        }
+        
+        if data["trusted_session_active"]:
+            current_time = time.time()
+            session_start = data["trusted_session_start"]
+            remaining_seconds = data["security_key_timeout"] - (current_time - session_start)
+            status["remaining_minutes"] = max(0, int(remaining_seconds // 60))
+        else:
+            status["remaining_minutes"] = 0
+            
+        return status
+        
+    except Exception as e:
+        log(f"Error getting security key status: {e}")
+        return {
+            "enabled": False,
+            "configured": False,
+            "timeout_minutes": 10,
+            "session_active": False,
+            "trusted_user": "",
+            "creation_date": "Unknown",
+            "last_updated": "Unknown",
+            "remaining_minutes": 0,
+            "error": str(e)
+        }
 
 def lock_windows_screen():
     """Lock the Windows screen"""
@@ -606,6 +781,41 @@ class CameraPreview(QMainWindow):
         button_layout4.addWidget(self.manage_trusted_btn)
         layout.addLayout(button_layout4)
         
+        # Security key management buttons
+        button_layout5 = QHBoxLayout()
+        self.set_security_key_btn = QPushButton("🔑 Set Security Key")
+        self.security_status_btn = QPushButton("📊 Security Status")
+        
+        # Apply dark theme to security key buttons
+        security_button_style = """
+            QPushButton {
+                background-color: #8B5CF6;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #7C3AED;
+                padding: 8px 12px;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #7C3AED;
+            }
+            QPushButton:pressed {
+                background-color: #6D28D9;
+            }
+            QPushButton:disabled {
+                background-color: #666;
+                color: #999;
+            }
+        """
+        
+        self.set_security_key_btn.setStyleSheet(security_button_style)
+        self.security_status_btn.setStyleSheet(security_button_style)
+        
+        button_layout5.addWidget(self.set_security_key_btn)
+        button_layout5.addWidget(self.security_status_btn)
+        layout.addLayout(button_layout5)
+        
         # Face Recognition Sensitivity Controls
         sensitivity_layout = QHBoxLayout()
         
@@ -734,6 +944,8 @@ class CameraPreview(QMainWindow):
         self.calibrate_btn.clicked.connect(self.calibrate_gestures)
         self.add_trusted_btn.clicked.connect(self.add_trusted_face_dialog)
         self.manage_trusted_btn.clicked.connect(self.manage_trusted_faces_dialog)
+        self.set_security_key_btn.clicked.connect(self.set_security_key_dialog)
+        self.security_status_btn.clicked.connect(self.security_status_dialog)
         
         # Reference to worker (will be set by main app)
         self.worker = None
@@ -996,6 +1208,87 @@ class CameraPreview(QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
+    def set_security_key_dialog(self):
+        """Show dialog to set or change security key"""
+        if not self.worker:
+            self.status_label.setText("Status: Worker not available")
+            return
+            
+        from PySide6.QtWidgets import QInputDialog, QMessageBox, QSpinBox
+        
+        # Get current status
+        status = get_security_key_status()
+        
+        # Get security key from user
+        key, ok = QInputDialog.getText(
+            self,
+            "🔑 Set Security Key",
+            "Enter a security key (minimum 4 characters):\n\n"
+            "This key will allow trusted users to temporarily\n"
+            "disable security alerts when entered correctly.",
+            text=""
+        )
+        
+        if not ok or not key.strip():
+            return
+            
+        if len(key.strip()) < 4:
+            QMessageBox.warning(
+                self,
+                "Invalid Key",
+                "Security key must be at least 4 characters long."
+            )
+            return
+        
+        # Get timeout duration
+        timeout_minutes, ok = QInputDialog.getInt(
+            self,
+            "🕐 Set Timeout",
+            "Enter timeout duration in minutes:",
+            value=10,  # Default 10 minutes
+            min=1,     # Minimum 1 minute
+            max=120    # Maximum 2 hours
+        )
+        
+        if not ok:
+            return
+        
+        # Set the security key
+        success, message = set_security_key(key.strip(), timeout_minutes)
+        
+        if success:
+            QMessageBox.information(
+                self,
+                "✅ Success",
+                f"Security key has been set successfully!\n\n"
+                f"• Timeout: {timeout_minutes} minutes\n"
+                f"• Status: Enabled\n\n"
+                f"Trusted users can now use this key to temporarily\n"
+                f"disable security alerts."
+            )
+            self.status_label.setText(f"Status: ✅ Security key set ({timeout_minutes}min timeout)")
+            log(f"Security key set via UI with {timeout_minutes} minute timeout")
+        else:
+            QMessageBox.warning(
+                self,
+                "❌ Failed",
+                f"Failed to set security key.\n\n"
+                f"Error: {message}"
+            )
+            self.status_label.setText(f"Status: ❌ Failed to set security key")
+
+    def security_status_dialog(self):
+        """Show security key status and management options"""
+        if not self.worker:
+            self.status_label.setText("Status: Worker not available")
+            return
+            
+        # Create and show security status dialog
+        dialog = SecurityStatusDialog(self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def update_sensitivity(self, value):
         """Update face recognition sensitivity"""
         if self.worker:
@@ -1218,6 +1511,16 @@ class VisionWorker(threading.Thread):
         # Trusted faces system
         self.trusted_faces = self._load_trusted_faces()
         self.pending_trusted_face = None  # For adding new trusted faces
+        
+        # Security key system for trusted users
+        self.security_key_enabled = self.settings.get("security_key_enabled", True)
+        self.security_key_timeout = self.settings.get("security_key_timeout", 600)  # 10 minutes
+        self.security_key_hash = self.settings.get("security_key_hash", "")
+        self.trusted_session_active = self.settings.get("trusted_session_active", False)
+        self.trusted_session_start = self.settings.get("trusted_session_start", 0)
+        self.trusted_user_name = self.settings.get("trusted_user_name", "")
+        self.security_key_warning_shown = False  # Track if 10-minute warning was shown
+        self.security_key_dialog = None  # Reference to security key dialog
 
     # ---------- Face registration & matching ----------
 
@@ -1499,6 +1802,125 @@ class VisionWorker(threading.Thread):
         except Exception as e:
             log(f"Error checking trusted faces: {e}")
             return False, None
+
+    # ---------- Security Key System ----------
+
+    def _handle_trusted_user_session(self, trusted_name, current_time):
+        """Handle trusted user session with security key requirements"""
+        if not self.security_key_enabled:
+            # Security key disabled, allow full access
+            log(f"Trusted user '{trusted_name}' detected - security key disabled")
+            return
+        
+        # Check if this is a new trusted user session
+        if not self.trusted_session_active or self.trusted_user_name != trusted_name:
+            # Start new trusted user session
+            self.trusted_session_active = True
+            self.trusted_session_start = current_time
+            self.trusted_user_name = trusted_name
+            self.security_key_warning_shown = False
+            
+            # Save session state
+            self.settings["trusted_session_active"] = True
+            self.settings["trusted_session_start"] = current_time
+            self.settings["trusted_user_name"] = trusted_name
+            save_settings(self.settings)
+            
+            log(f"Started trusted user session for '{trusted_name}'")
+            self.on_toast(f"👤 Trusted user '{trusted_name}' detected - Session started", "green")
+        
+        # Check session timeout
+        session_duration = current_time - self.trusted_session_start
+        time_remaining = self.security_key_timeout - session_duration
+        
+        if time_remaining <= 0:
+            # Session expired, require security key
+            self._require_security_key(trusted_name)
+        elif time_remaining <= 60 and not self.security_key_warning_shown:
+            # Show 1-minute warning
+            self.security_key_warning_shown = True
+            self.on_toast(f"⏰ Security key required in {int(time_remaining)} seconds", "orange")
+            log(f"Security key warning shown for '{trusted_name}' - {int(time_remaining)} seconds remaining")
+    
+    def _require_security_key(self, trusted_name):
+        """Require security key from trusted user"""
+        if self.security_key_dialog is not None:
+            return  # Dialog already shown
+        
+        log(f"Security key required for trusted user '{trusted_name}'")
+        self.on_toast(f"🔐 Security key required for '{trusted_name}'", "red")
+        
+        # Show security key dialog
+        self._show_security_key_dialog(trusted_name)
+    
+    def _show_security_key_dialog(self, trusted_name):
+        """Show security key input dialog"""
+        try:
+            from PySide6.QtCore import QTimer
+            from PySide6.QtWidgets import QApplication
+            
+            # Create and show dialog in main thread
+            QTimer.singleShot(0, lambda: self._create_security_key_dialog(trusted_name))
+            
+        except Exception as e:
+            log(f"Error showing security key dialog: {e}")
+    
+    def _create_security_key_dialog(self, trusted_name):
+        """Create security key dialog in main thread"""
+        try:
+            dialog = SecurityKeyDialog(trusted_name, self)
+            dialog.show()
+            self.security_key_dialog = dialog
+            
+        except Exception as e:
+            log(f"Error creating security key dialog: {e}")
+    
+    def verify_security_key(self, entered_key, trusted_name):
+        """Verify the entered security key"""
+        if not self.security_key_hash:
+            # No security key set, deny access
+            log(f"Security key verification failed - no key set")
+            return False, "No security key configured. Please ask the owner to set one."
+        
+        # Hash the entered key and compare
+        import hashlib
+        entered_hash = hashlib.sha256(entered_key.encode()).hexdigest()
+        
+        if entered_hash == self.security_key_hash:
+            # Correct key, extend session
+            self.trusted_session_start = time.time()
+            self.security_key_warning_shown = False
+            
+            # Save updated session
+            self.settings["trusted_session_start"] = self.trusted_session_start
+            save_settings(self.settings)
+            
+            log(f"Security key verified for '{trusted_name}' - session extended")
+            self.on_toast(f"✅ Security key verified - Session extended", "green")
+            return True, "Security key verified successfully!"
+        else:
+            log(f"Security key verification failed for '{trusted_name}'")
+            return False, "Incorrect security key. Please try again."
+    
+    def end_trusted_session(self):
+        """End the current trusted user session"""
+        if self.trusted_session_active:
+            log(f"Ending trusted user session for '{self.trusted_user_name}'")
+            
+            self.trusted_session_active = False
+            self.trusted_session_start = 0
+            self.trusted_user_name = ""
+            self.security_key_warning_shown = False
+            
+            # Clear session state
+            self.settings["trusted_session_active"] = False
+            self.settings["trusted_session_start"] = 0
+            self.settings["trusted_user_name"] = ""
+            save_settings(self.settings)
+            
+            if self.security_key_dialog:
+                self.security_key_dialog.close()
+                self.security_key_dialog = None
 
     # ---------- Brightness helpers ----------
 
@@ -1969,6 +2391,25 @@ class VisionWorker(threading.Thread):
                     # Show toast notification
                     self.on_toast("⏰ System awake - Monitoring resumed", "green")
     
+    def check_security_key_timeout(self):
+        """Check if trusted session has timed out and handle accordingly"""
+        try:
+            timed_out, message = check_trusted_session_timeout()
+            
+            if timed_out:
+                status = get_security_key_status()
+                if status.get("session_active", False):
+                    # Session was active but timed out
+                    user_name = status.get("trusted_user", "Unknown")
+                    log(f"🔑 Trusted session timed out for user: {user_name}")
+                    self.on_toast(f"🔑 Trusted session expired for {user_name}", "orange")
+                    
+                    # End the session
+                    end_trusted_session()
+                    
+        except Exception as e:
+            log(f"Error checking security key timeout: {e}")
+    
     # ---------- Main loop ----------
 
     def run(self):
@@ -1994,6 +2435,9 @@ class VisionWorker(threading.Thread):
         while self.running:
             # Check system state first
             self.check_system_state()
+            
+            # Check security key timeout
+            self.check_security_key_timeout()
             
             # Skip processing if program is paused (system locked or sleeping)
             if self.program_paused:
@@ -2151,23 +2595,37 @@ class VisionWorker(threading.Thread):
                 is_trusted, trusted_name = self.is_trusted_face(frame)
                 
                 if is_trusted:
-                    # Trusted face detected - no alert needed
+                    # Trusted face detected - handle security key logic
                     log(f"Trusted face detected: {trusted_name}")
-                    # Don't dim brightness or show alerts for trusted faces
+                    self._handle_trusted_user_session(trusted_name, now)
                 else:
-                    # Unknown face detected - proceed with normal security measures
-                    # Save unknown face image
-                    self.save_unknown_face(frame, face_boxes)
+                    # Unknown face detected - check if trusted session is active
+                    security_status = get_security_key_status()
                     
-                    # Only trigger gesture confirmation if we weren't already waiting
-                    if not self.awaiting_gesture and not self.gesture_test_mode and (now - self.last_unknown_ts) > 2.0:
-                        self.last_unknown_ts = now
-                        self.awaiting_gesture = True
-                        self.gesture_deadline = now + 6.0  # 6 seconds to confirm
-                        log("Unknown face detected → awaiting gesture confirmation.")
-                        log("DEBUG: Calling toast for unknown face detected")
-                        self.on_unknown_face()
-                        self.on_toast("🚨 UNKNOWN FACE DETECTED — Nod twice to dim, Shake to cancel", "red")
+                    if security_status['session_active']:
+                        # Trusted session is active - skip security alerts
+                        user_name = security_status['trusted_user']
+                        remaining_minutes = security_status['remaining_minutes']
+                        log(f"Unknown face detected but trusted session active for '{user_name}' ({remaining_minutes}min remaining) - skipping alerts")
+                        
+                        # Show subtle notification instead of alarm
+                        if (now - self.last_unknown_ts) > 10.0:  # Only show every 10 seconds
+                            self.last_unknown_ts = now
+                            self.on_toast(f"👁️ Face detected - Trusted session active ({user_name})", "green")
+                    else:
+                        # No trusted session - proceed with normal security measures
+                        # Save unknown face image
+                        self.save_unknown_face(frame, face_boxes)
+                        
+                        # Only trigger gesture confirmation if we weren't already waiting
+                        if not self.awaiting_gesture and not self.gesture_test_mode and (now - self.last_unknown_ts) > 2.0:
+                            self.last_unknown_ts = now
+                            self.awaiting_gesture = True
+                            self.gesture_deadline = now + 6.0  # 6 seconds to confirm
+                            log("Unknown face detected → awaiting gesture confirmation.")
+                            log("DEBUG: Calling toast for unknown face detected")
+                            self.on_unknown_face()
+                            self.on_toast("🚨 UNKNOWN FACE DETECTED — Nod twice to dim, Shake to cancel", "red")
 
             # If awaiting gesture, evaluate nod/shake (but not during gesture test)
             if self.awaiting_gesture and not self.gesture_test_mode:
@@ -2206,7 +2664,7 @@ class SettingsWindow(QMainWindow):
         super().__init__()
         self.worker = worker
         self.setWindowTitle("FaceGuard • Settings")
-        self.setFixedSize(450, 380)
+        self.setFixedSize(500, 600)
         self.setWindowFlags(Qt.Window)
         
         # Dark theme styling
@@ -2416,6 +2874,101 @@ class SettingsWindow(QMainWindow):
         
         layout.addLayout(timing_layout)
         
+        # Security Key Settings (Owner Only)
+        security_group = QLabel("🔐 Security Key Settings (Owner Only)")
+        security_group.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                color: #4CAF50;
+                padding: 10px;
+                background-color: #404040;
+                border-radius: 5px;
+                margin: 10px 0px 5px 0px;
+            }
+        """)
+        layout.addWidget(security_group)
+        
+        # Security key enabled checkbox
+        self.security_key_checkbox = QCheckBox("🔑 Enable security key for trusted users")
+        self.security_key_checkbox.setToolTip("Require security key from trusted users after 10 minutes without owner")
+        self.security_key_checkbox.setStyleSheet("color: #ffffff; font-weight: bold; padding: 5px;")
+        layout.addWidget(self.security_key_checkbox)
+        
+        # Security key timeout setting
+        timeout_layout = QHBoxLayout()
+        timeout_label = QLabel("⏰ Security key timeout:")
+        timeout_label.setStyleSheet("color: #ffffff; font-weight: bold; padding: 5px;")
+        
+        self.timeout_spinbox = QSpinBox()
+        self.timeout_spinbox.setMinimum(1)
+        self.timeout_spinbox.setMaximum(60)
+        self.timeout_spinbox.setValue(10)
+        self.timeout_spinbox.setSuffix(" minutes")
+        self.timeout_spinbox.setToolTip("Time before trusted users need to enter security key")
+        self.timeout_spinbox.setStyleSheet("""
+            QSpinBox {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666;
+                padding: 5px;
+                border-radius: 3px;
+                font-weight: bold;
+                min-height: 24px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                background-color: #505050;
+                border: 1px solid #666;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background-color: #606060;
+            }
+        """)
+        
+        timeout_layout.addWidget(timeout_label)
+        timeout_layout.addWidget(self.timeout_spinbox)
+        timeout_layout.addStretch()
+        layout.addLayout(timeout_layout)
+        
+        # Security key input
+        key_layout = QHBoxLayout()
+        key_label = QLabel("🔑 Security key:")
+        key_label.setStyleSheet("color: #ffffff; font-weight: bold; padding: 5px;")
+        
+        from PySide6.QtWidgets import QLineEdit
+        self.security_key_input = QLineEdit()
+        self.security_key_input.setEchoMode(QLineEdit.Password)
+        self.security_key_input.setPlaceholderText("Enter new security key (leave empty to disable)")
+        self.security_key_input.setToolTip("Set a security key that trusted users must enter after timeout")
+        self.security_key_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #404040;
+                color: #ffffff;
+                border: 2px solid #666;
+                padding: 8px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QLineEdit:focus {
+                border: 2px solid #4CAF50;
+            }
+        """)
+        
+        key_layout.addWidget(key_label)
+        key_layout.addWidget(self.security_key_input)
+        layout.addLayout(key_layout)
+        
+        # Security key status
+        self.security_key_status = QLabel("")
+        self.security_key_status.setStyleSheet("""
+            QLabel {
+                padding: 5px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+        """)
+        layout.addWidget(self.security_key_status)
+        
         # Performance mode checkbox
         self.performance_checkbox = QCheckBox("⚡ Performance mode (faster detection)")
         self.performance_checkbox.setToolTip("Enable optimized detection for better performance")
@@ -2441,27 +2994,142 @@ class SettingsWindow(QMainWindow):
     
     def load_current_settings(self):
         """Load current settings into the UI"""
-        settings = self.worker.settings
-        self.auto_lock_checkbox.setChecked(settings.get("auto_lock_enabled", False))
-        self.delay_spinbox.setValue(int(settings.get("owner_absence_delay", 3.0)))
-        self.grace_spinbox.setValue(int(settings.get("auto_lock_grace_period", 30.0)))
-        self.performance_checkbox.setChecked(settings.get("performance_mode", True))
+        try:
+            settings = self.worker.settings
+            
+            # Load basic settings
+            self.auto_lock_checkbox.setChecked(settings.get("auto_lock_enabled", False))
+            self.delay_spinbox.setValue(int(settings.get("owner_absence_delay", 3.0)))
+            self.grace_spinbox.setValue(int(settings.get("auto_lock_grace_period", 30.0)))
+            self.performance_checkbox.setChecked(settings.get("performance_mode", True))
+            
+            # Load security key settings - check both settings.json and security_key.json
+            security_status = get_security_key_status()
+            
+            # Use security key status for more accurate information
+            self.security_key_checkbox.setChecked(security_status.get("enabled", True))
+            timeout_minutes = security_status.get("timeout_minutes", 10)
+            self.timeout_spinbox.setValue(timeout_minutes)
+            
+            # Show security key status
+            if security_status.get("configured", False):
+                creation_date = security_status.get("creation_date", "Unknown")
+                self.security_key_status.setText(f"✅ Security key configured (Created: {creation_date})")
+                self.security_key_status.setStyleSheet("""
+                    QLabel {
+                        padding: 8px;
+                        border-radius: 5px;
+                        font-weight: bold;
+                        background-color: #d4edda;
+                        color: #155724;
+                        border: 1px solid #c3e6cb;
+                    }
+                """)
+            else:
+                self.security_key_status.setText("⚠️ No security key configured")
+                self.security_key_status.setStyleSheet("""
+                    QLabel {
+                        padding: 8px;
+                        border-radius: 5px;
+                        font-weight: bold;
+                        background-color: #fff3cd;
+                        color: #856404;
+                        border: 1px solid #ffeaa7;
+                    }
+                """)
+            
+            log("Settings loaded successfully into UI")
+            
+        except Exception as e:
+            log(f"Error loading settings into UI: {e}")
+            # Set default values if loading fails
+            self.auto_lock_checkbox.setChecked(False)
+            self.delay_spinbox.setValue(3)
+            self.grace_spinbox.setValue(30)
+            self.security_key_checkbox.setChecked(True)
+            self.timeout_spinbox.setValue(10)
+            self.performance_checkbox.setChecked(True)
+            
+            self.security_key_status.setText("❌ Error loading security key status")
+            self.security_key_status.setStyleSheet("""
+                QLabel {
+                    padding: 8px;
+                    border-radius: 5px;
+                    font-weight: bold;
+                    background-color: #f8d7da;
+                    color: #721c24;
+                    border: 1px solid #f5c6cb;
+                }
+            """)
     
     def save_settings(self):
         """Save settings and close window"""
-        self.worker.settings["auto_lock_enabled"] = self.auto_lock_checkbox.isChecked()
-        self.worker.settings["owner_absence_delay"] = float(self.delay_spinbox.value())
-        self.worker.settings["auto_lock_grace_period"] = float(self.grace_spinbox.value())
-        self.worker.settings["performance_mode"] = self.performance_checkbox.isChecked()
-        save_settings(self.worker.settings)
+        from PySide6.QtWidgets import QMessageBox
         
-        # Update worker settings immediately
-        self.worker.auto_lock_enabled = self.worker.settings["auto_lock_enabled"]
-        self.worker.owner_absence_delay = self.worker.settings["owner_absence_delay"]
-        self.worker.auto_lock_grace_period = self.worker.settings["auto_lock_grace_period"]
-        
-        log(f"Settings saved - Auto-lock: {self.auto_lock_checkbox.isChecked()}, Delay: {self.delay_spinbox.value()}s, Grace: {self.grace_spinbox.value()}s, Performance: {self.performance_checkbox.isChecked()}")
-        self.close()
+        try:
+            # Save basic settings
+            self.worker.settings["auto_lock_enabled"] = self.auto_lock_checkbox.isChecked()
+            self.worker.settings["owner_absence_delay"] = float(self.delay_spinbox.value())
+            self.worker.settings["auto_lock_grace_period"] = float(self.grace_spinbox.value())
+            self.worker.settings["performance_mode"] = self.performance_checkbox.isChecked()
+            
+            # Save security key settings
+            self.worker.settings["security_key_enabled"] = self.security_key_checkbox.isChecked()
+            self.worker.settings["security_key_timeout"] = self.timeout_spinbox.value() * 60  # Convert minutes to seconds
+            
+            # Handle security key input
+            new_key = self.security_key_input.text().strip()
+            if new_key:
+                # Set new security key
+                success, message = set_security_key(new_key, self.timeout_spinbox.value())
+                if success:
+                    log(f"Security key updated via settings: {message}")
+                    # Update the hash in worker settings for compatibility
+                    self.worker.settings["security_key_hash"] = hash_security_key(new_key)
+                else:
+                    QMessageBox.warning(self, "Security Key Error", f"Failed to set security key: {message}")
+                    return  # Don't close if security key failed
+            
+            # Save settings to file
+            save_settings(self.worker.settings)
+            
+            # Update worker settings immediately
+            self.worker.auto_lock_enabled = self.worker.settings["auto_lock_enabled"]
+            self.worker.owner_absence_delay = self.worker.settings["owner_absence_delay"]
+            self.worker.auto_lock_grace_period = self.worker.settings["auto_lock_grace_period"]
+            self.worker.security_key_enabled = self.worker.settings["security_key_enabled"]
+            self.worker.security_key_timeout = self.worker.settings["security_key_timeout"]
+            
+            # Show success message
+            QMessageBox.information(
+                self,
+                "✅ Settings Saved",
+                "Settings have been saved successfully!\n\n"
+                f"• Auto-lock: {'Enabled' if self.auto_lock_checkbox.isChecked() else 'Disabled'}\n"
+                f"• Screen dim delay: {self.delay_spinbox.value()} seconds\n"
+                f"• Lock grace period: {self.grace_spinbox.value()} seconds\n"
+                f"• Security key: {'Enabled' if self.security_key_checkbox.isChecked() else 'Disabled'}\n"
+                f"• Security timeout: {self.timeout_spinbox.value()} minutes\n"
+                f"• Performance mode: {'Enabled' if self.performance_checkbox.isChecked() else 'Disabled'}"
+            )
+            
+            log(f"Settings saved successfully - Auto-lock: {self.auto_lock_checkbox.isChecked()}, "
+                f"Delay: {self.delay_spinbox.value()}s, Grace: {self.grace_spinbox.value()}s, "
+                f"Security key: {self.security_key_checkbox.isChecked()}, "
+                f"Security timeout: {self.timeout_spinbox.value()}min, "
+                f"Performance: {self.performance_checkbox.isChecked()}")
+            
+            self.close()
+            
+        except Exception as e:
+            log(f"Error saving settings: {e}")
+            QMessageBox.critical(
+                self,
+                "❌ Save Error",
+                f"Failed to save settings:\n\n{str(e)}\n\nPlease check the logs for more details."
+            )
+            import traceback
+            log(f"Settings save error traceback: {traceback.format_exc()}")
 
 # ------------------- Trusted Faces Dialog -------------------
 
@@ -2716,6 +3384,544 @@ class TrustedFacesDialog(QMainWindow):
                 self.status_label.setText(f"❌ Failed to remove '{name}'")
                 # Refresh the list in case the data changed
                 self.refresh_list()
+
+# ------------------- Security Key Dialog -------------------
+
+class SecurityKeyDialog(QMainWindow):
+    def __init__(self, trusted_name, worker, parent=None):
+        super().__init__(parent)
+        self.trusted_name = trusted_name
+        self.worker = worker
+        self.setWindowTitle("Security Key Required")
+        self.setMinimumSize(450, 300)
+        self.setMaximumSize(450, 300)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        
+        # Set window icon
+        icon_path = os.path.join(SCRIPT_DIR, "icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
+        # Main widget and layout
+        main_widget = QWidget()
+        main_widget.setStyleSheet("background-color: #2b2b2b; color: #ffffff;")
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        
+        # Title with warning icon
+        title_label = QLabel("🔐 Security Key Required")
+        title_label.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #ff6b6b;
+                padding: 15px;
+                background-color: #404040;
+                border-radius: 8px;
+                margin-bottom: 15px;
+                text-align: center;
+            }
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Message
+        message_label = QLabel(
+            f"Trusted user '{trusted_name}' detected without owner present.\n\n"
+            f"⏰ Your session has expired after 10 minutes.\n"
+            f"🔑 Please enter the security key to continue."
+        )
+        message_label.setStyleSheet("""
+            QLabel {
+                font-size: 14px;
+                color: #ffffff;
+                padding: 10px;
+                background-color: #1e1e1e;
+                border-radius: 5px;
+                border: 1px solid #555;
+                line-height: 1.4;
+            }
+        """)
+        message_label.setWordWrap(True)
+        layout.addWidget(message_label)
+        
+        # Security key input
+        from PySide6.QtWidgets import QLineEdit
+        input_label = QLabel("Security Key:")
+        input_label.setStyleSheet("color: #ffffff; font-weight: bold; margin-top: 10px;")
+        layout.addWidget(input_label)
+        
+        self.key_input = QLineEdit()
+        self.key_input.setEchoMode(QLineEdit.Password)
+        self.key_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #404040;
+                color: #ffffff;
+                border: 2px solid #666;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QLineEdit:focus {
+                border: 2px solid #4CAF50;
+            }
+        """)
+        self.key_input.setPlaceholderText("Enter security key...")
+        layout.addWidget(self.key_input)
+        
+        # Status label
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                padding: 8px;
+                border-radius: 5px;
+                font-weight: bold;
+                min-height: 20px;
+            }
+        """)
+        layout.addWidget(self.status_label)
+        
+        # Buttons
+        from PySide6.QtWidgets import QHBoxLayout, QPushButton
+        button_layout = QHBoxLayout()
+        
+        self.verify_btn = QPushButton("🔓 Verify Key")
+        self.cancel_btn = QPushButton("❌ Cancel")
+        
+        # Button styling
+        button_style = """
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #45a049;
+                padding: 12px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """
+        
+        cancel_style = """
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #c82333;
+                padding: 12px 20px;
+                border-radius: 5px;
+                font-size: 14px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+            QPushButton:pressed {
+                background-color: #bd2130;
+            }
+        """
+        
+        self.verify_btn.setStyleSheet(button_style)
+        self.cancel_btn.setStyleSheet(cancel_style)
+        
+        button_layout.addWidget(self.verify_btn)
+        button_layout.addWidget(self.cancel_btn)
+        layout.addLayout(button_layout)
+        
+        # Connect signals
+        self.verify_btn.clicked.connect(self.verify_key)
+        self.cancel_btn.clicked.connect(self.cancel_dialog)
+        self.key_input.returnPressed.connect(self.verify_key)
+        
+        # Focus on input
+        self.key_input.setFocus()
+        
+        # Auto-close timer (optional - 5 minutes)
+        from PySide6.QtCore import QTimer
+        self.auto_close_timer = QTimer()
+        self.auto_close_timer.timeout.connect(self.auto_close)
+        self.auto_close_timer.start(300000)  # 5 minutes
+        
+    def verify_key(self):
+        """Verify the entered security key"""
+        entered_key = self.key_input.text().strip()
+        
+        if not entered_key:
+            self.show_status("Please enter a security key", "error")
+            return
+        
+        self.status_label.setText("🔄 Verifying key...")
+        self.verify_btn.setEnabled(False)
+        
+        # Verify with worker
+        success, message = self.worker.verify_security_key(entered_key, self.trusted_name)
+        
+        if success:
+            self.show_status("✅ Key verified successfully!", "success")
+            # Close dialog after short delay
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(1500, self.accept_dialog)
+        else:
+            self.show_status(f"❌ {message}", "error")
+            self.key_input.clear()
+            self.key_input.setFocus()
+            self.verify_btn.setEnabled(True)
+    
+    def show_status(self, message, status_type):
+        """Show status message with appropriate styling"""
+        if status_type == "success":
+            style = "background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb;"
+        elif status_type == "error":
+            style = "background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb;"
+        else:
+            style = "background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb;"
+        
+        self.status_label.setStyleSheet(f"""
+            QLabel {{
+                padding: 8px;
+                border-radius: 5px;
+                font-weight: bold;
+                min-height: 20px;
+                {style}
+            }}
+        """)
+        self.status_label.setText(message)
+    
+    def cancel_dialog(self):
+        """Cancel the dialog and end trusted session"""
+        self.worker.end_trusted_session()
+        self.close()
+    
+    def accept_dialog(self):
+        """Accept the dialog after successful verification"""
+        self.close()
+    
+    def auto_close(self):
+        """Auto-close dialog after timeout"""
+        self.worker.end_trusted_session()
+        self.close()
+    
+    def closeEvent(self, event):
+        """Handle dialog close event"""
+        # Clear the dialog reference in worker
+        if self.worker.security_key_dialog == self:
+            self.worker.security_key_dialog = None
+        super().closeEvent(event)
+
+# ------------------- Security Status Dialog -------------------
+
+class SecurityStatusDialog(QMainWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Security Key Status")
+        self.setMinimumSize(500, 400)
+        self.setWindowFlags(Qt.Window)
+        
+        # Set window icon
+        icon_path = os.path.join(SCRIPT_DIR, "icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
+        # Main widget and layout
+        main_widget = QWidget()
+        main_widget.setStyleSheet("background-color: #2b2b2b; color: #ffffff;")
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        
+        # Title
+        title_label = QLabel("🔑 Security Key Status & Management")
+        title_label.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: #ffffff;
+                padding: 10px;
+                background-color: #404040;
+                border-radius: 5px;
+                margin-bottom: 10px;
+            }
+        """)
+        layout.addWidget(title_label)
+        
+        # Status display area
+        self.status_text = QTextEdit()
+        self.status_text.setReadOnly(True)
+        self.status_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                border: 1px solid #555;
+                border-radius: 5px;
+                padding: 10px;
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 11pt;
+            }
+        """)
+        layout.addWidget(self.status_text)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        button_style = """
+            QPushButton {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666;
+                padding: 10px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+                border: 1px solid #888;
+            }
+            QPushButton:pressed {
+                background-color: #303030;
+            }
+        """
+        
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.enter_key_btn = QPushButton("🔑 Enter Security Key")
+        self.end_session_btn = QPushButton("🚪 End Session")
+        self.close_btn = QPushButton("✅ Close")
+        
+        # Special styling for action buttons
+        enter_key_style = """
+            QPushButton {
+                background-color: #10B981;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #059669;
+                padding: 10px 15px;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+            QPushButton:pressed {
+                background-color: #047857;
+            }
+        """
+        
+        end_session_style = """
+            QPushButton {
+                background-color: #EF4444;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #DC2626;
+                padding: 10px 15px;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #DC2626;
+            }
+            QPushButton:pressed {
+                background-color: #B91C1C;
+            }
+        """
+        
+        self.refresh_btn.setStyleSheet(button_style)
+        self.enter_key_btn.setStyleSheet(enter_key_style)
+        self.end_session_btn.setStyleSheet(end_session_style)
+        self.close_btn.setStyleSheet(button_style)
+        
+        button_layout.addWidget(self.refresh_btn)
+        button_layout.addWidget(self.enter_key_btn)
+        button_layout.addWidget(self.end_session_btn)
+        button_layout.addStretch()
+        button_layout.addWidget(self.close_btn)
+        layout.addLayout(button_layout)
+        
+        # Connect buttons
+        self.refresh_btn.clicked.connect(self.refresh_status)
+        self.enter_key_btn.clicked.connect(self.enter_security_key)
+        self.end_session_btn.clicked.connect(self.end_current_session)
+        self.close_btn.clicked.connect(self.close)
+        
+        # Load initial status
+        self.refresh_status()
+    
+    def refresh_status(self):
+        """Refresh and display current security key status"""
+        try:
+            status = get_security_key_status()
+            
+            status_text = "🔑 SECURITY KEY STATUS\n"
+            status_text += "=" * 50 + "\n\n"
+            
+            # Basic configuration
+            status_text += f"🔧 Configuration:\n"
+            status_text += f"   • Enabled: {'✅ Yes' if status['enabled'] else '❌ No'}\n"
+            status_text += f"   • Configured: {'✅ Yes' if status['configured'] else '❌ No'}\n"
+            status_text += f"   • Timeout: {status['timeout_minutes']} minutes\n"
+            status_text += f"   • Created: {status['creation_date']}\n"
+            status_text += f"   • Updated: {status['last_updated']}\n\n"
+            
+            # Session status
+            status_text += f"🎯 Current Session:\n"
+            if status['session_active']:
+                status_text += f"   • Status: 🟢 ACTIVE\n"
+                status_text += f"   • User: {status['trusted_user']}\n"
+                status_text += f"   • Remaining: {status['remaining_minutes']} minutes\n"
+                status_text += f"   • Security alerts: 🔕 DISABLED\n"
+            else:
+                status_text += f"   • Status: 🔴 INACTIVE\n"
+                status_text += f"   • Security alerts: 🔔 ENABLED\n"
+            
+            status_text += "\n" + "=" * 50 + "\n\n"
+            
+            # Instructions
+            if not status['configured']:
+                status_text += "📝 SETUP REQUIRED:\n"
+                status_text += "   1. Click 'Set Security Key' in camera preview\n"
+                status_text += "   2. Enter a secure key (min 4 characters)\n"
+                status_text += "   3. Set timeout duration\n\n"
+            elif not status['session_active']:
+                status_text += "🔑 TO START TRUSTED SESSION:\n"
+                status_text += "   1. Click 'Enter Security Key' below\n"
+                status_text += "   2. Enter your security key\n"
+                status_text += "   3. Security alerts will be disabled temporarily\n\n"
+            else:
+                status_text += "✅ TRUSTED SESSION ACTIVE:\n"
+                status_text += "   • Security alerts are currently disabled\n"
+                status_text += "   • Session will auto-expire when timeout reached\n"
+                status_text += "   • Click 'End Session' to end early\n\n"
+            
+            # Error handling
+            if 'error' in status:
+                status_text += f"❌ ERROR: {status['error']}\n\n"
+            
+            self.status_text.setPlainText(status_text)
+            
+            # Update button states
+            self.enter_key_btn.setEnabled(status['configured'] and not status['session_active'])
+            self.end_session_btn.setEnabled(status['session_active'])
+            
+        except Exception as e:
+            error_text = f"❌ ERROR LOADING STATUS:\n\n{str(e)}\n\n"
+            error_text += "Please check the logs for more details."
+            self.status_text.setPlainText(error_text)
+            log(f"Error refreshing security status: {e}")
+    
+    def enter_security_key(self):
+        """Prompt user to enter security key and start trusted session"""
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        
+        key, ok = QInputDialog.getText(
+            self,
+            "🔑 Enter Security Key",
+            "Enter your security key to start a trusted session:\n\n"
+            "During the trusted session, security alerts will be\n"
+            "temporarily disabled for the configured timeout period.",
+            text=""
+        )
+        
+        if not ok or not key.strip():
+            return
+        
+        # Verify the key
+        success, message = verify_security_key(key.strip())
+        
+        if success:
+            # Get user name for the session
+            user_name, ok = QInputDialog.getText(
+                self,
+                "👤 User Name",
+                "Enter your name for this trusted session:",
+                text="Trusted User"
+            )
+            
+            if not ok or not user_name.strip():
+                user_name = "Trusted User"
+            
+            # Start the trusted session
+            session_success, session_message = start_trusted_session(user_name.strip())
+            
+            if session_success:
+                QMessageBox.information(
+                    self,
+                    "✅ Success",
+                    f"Trusted session started successfully!\n\n"
+                    f"• User: {user_name.strip()}\n"
+                    f"• Duration: Security alerts disabled\n"
+                    f"• {session_message}\n\n"
+                    f"The session will automatically expire when the\n"
+                    f"timeout period is reached."
+                )
+                self.refresh_status()
+                log(f"Trusted session started via UI for user: {user_name.strip()}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "❌ Session Error",
+                    f"Security key verified but failed to start session.\n\n"
+                    f"Error: {session_message}"
+                )
+        else:
+            QMessageBox.warning(
+                self,
+                "❌ Invalid Key",
+                f"Security key verification failed.\n\n"
+                f"Error: {message}\n\n"
+                f"Please check your key and try again."
+            )
+    
+    def end_current_session(self):
+        """End the current trusted session"""
+        from PySide6.QtWidgets import QMessageBox
+        
+        status = get_security_key_status()
+        if not status['session_active']:
+            QMessageBox.information(
+                self,
+                "ℹ️ No Active Session",
+                "There is no active trusted session to end."
+            )
+            return
+        
+        user_name = status['trusted_user']
+        remaining_minutes = status['remaining_minutes']
+        
+        reply = QMessageBox.question(
+            self,
+            "🚪 End Session",
+            f"Are you sure you want to end the trusted session?\n\n"
+            f"• User: {user_name}\n"
+            f"• Remaining time: {remaining_minutes} minutes\n\n"
+            f"Security alerts will be re-enabled immediately.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            success, message = end_trusted_session()
+            
+            if success:
+                QMessageBox.information(
+                    self,
+                    "✅ Session Ended",
+                    f"Trusted session ended successfully.\n\n"
+                    f"Security alerts are now re-enabled."
+                )
+                self.refresh_status()
+                log(f"Trusted session ended via UI for user: {user_name}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "❌ Error",
+                    f"Failed to end trusted session.\n\n"
+                    f"Error: {message}"
+                )
 
 # ---------------------- Main Application ----------------------
 
