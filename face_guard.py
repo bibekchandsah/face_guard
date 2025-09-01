@@ -704,6 +704,8 @@ class CameraPreview(QMainWindow):
         self.train_nod_btn.clicked.connect(self.train_nod_gesture)
         self.train_shake_btn.clicked.connect(self.train_shake_gesture)
         self.calibrate_btn.clicked.connect(self.calibrate_gestures)
+        self.add_trusted_btn.clicked.connect(self.add_trusted_face_dialog)
+        self.manage_trusted_btn.clicked.connect(self.manage_trusted_faces_dialog)
         
         # Reference to worker (will be set by main app)
         self.worker = None
@@ -864,6 +866,108 @@ class CameraPreview(QMainWindow):
             else:
                 self.status_label.setText("Status: ❌ Calibration failed - try again")
     
+    def add_trusted_face_dialog(self):
+        """Show dialog to add a new trusted face"""
+        if not self.worker:
+            self.status_label.setText("Status: Worker not available")
+            return
+            
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        
+        # Get name for the trusted face
+        name, ok = QInputDialog.getText(
+            self, 
+            "Add Trusted Face", 
+            "Enter a name for this trusted face:",
+            text="Trusted Person"
+        )
+        
+        if not ok or not name.strip():
+            return
+            
+        name = name.strip()
+        
+        # Check if name already exists
+        for trusted_face in self.worker.trusted_faces:
+            if trusted_face["name"].lower() == name.lower():
+                QMessageBox.warning(
+                    self,
+                    "Name Already Exists",
+                    f"A trusted face with the name '{name}' already exists.\nPlease choose a different name."
+                )
+                return
+        
+        # Debug: Check if face_recognition is available
+        if not HAS_FACE_REC:
+            QMessageBox.warning(
+                self,
+                "Face Recognition Not Available",
+                "The face_recognition library is not available. Trusted faces feature requires this library."
+            )
+            self.status_label.setText("Status: face_recognition library not available")
+            return
+        
+        # Get current frame from worker - try multiple sources
+        frame = None
+        if hasattr(self.worker, 'current_frame') and self.worker.current_frame is not None:
+            frame = self.worker.current_frame
+            log(f"DEBUG: Got frame from worker.current_frame, shape: {frame.shape}")
+        elif hasattr(self, 'current_frame') and self.current_frame is not None:
+            frame = self.current_frame
+            log(f"DEBUG: Got frame from preview.current_frame, shape: {frame.shape}")
+        
+        if frame is None:
+            QMessageBox.warning(
+                self,
+                "No Camera Feed",
+                "No camera feed available. Please ensure the camera is working and try again."
+            )
+            self.status_label.setText("Status: No camera feed available")
+            return
+        
+        # Add the trusted face with detailed error reporting
+        log(f"DEBUG: Attempting to add trusted face '{name}' from frame")
+        success, error_msg = self.worker.add_trusted_face(frame, name)
+        
+        if success:
+            QMessageBox.information(
+                self,
+                "✅ Success",
+                f"Successfully added '{name}' as a trusted face!\n\n"
+                f"• Name: {name}\n"
+                f"• Added: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"• Total trusted faces: {len(self.worker.trusted_faces)}"
+            )
+            self.status_label.setText(f"Status: ✅ Added trusted face '{name}'")
+            log(f"Successfully added trusted face: {name}")
+        else:
+            # Show detailed error message from the worker
+            QMessageBox.warning(
+                self,
+                "❌ Failed to Add Trusted Face",
+                f"Could not add '{name}' as a trusted face.\n\n"
+                f"Reason: {error_msg}\n\n"
+                f"Tips:\n"
+                f"• Ensure good lighting\n"
+                f"• Position face clearly in camera view\n"
+                f"• Only one person should be visible\n"
+                f"• Make sure camera is working properly"
+            )
+            self.status_label.setText(f"Status: ❌ Failed to add trusted face - {error_msg}")
+            log(f"Failed to add trusted face '{name}': {error_msg}")
+    
+    def manage_trusted_faces_dialog(self):
+        """Show dialog to manage existing trusted faces"""
+        if not self.worker:
+            self.status_label.setText("Status: Worker not available")
+            return
+            
+        # Create and show trusted faces management window
+        dialog = TrustedFacesDialog(self.worker, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def update_sensitivity(self, value):
         """Update face recognition sensitivity"""
         if self.worker:
@@ -1236,34 +1340,52 @@ class VisionWorker(threading.Thread):
     def add_trusted_face(self, frame_bgr, name):
         """Add a new trusted face from the current frame"""
         if not HAS_FACE_REC:
-            log("Cannot add trusted face - face_recognition library not available")
-            return False
+            error_msg = "face_recognition library not available"
+            log(f"Cannot add trusted face - {error_msg}")
+            return False, error_msg
         
         try:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Try HOG model first (faster)
             boxes = face_recognition.face_locations(rgb, model="hog")
             
+            # If HOG fails, try CNN model (more accurate but slower)
             if not boxes:
-                log("No face detected in frame for trusted face addition")
-                return False
+                log("HOG model found no faces, trying CNN model...")
+                try:
+                    boxes = face_recognition.face_locations(rgb, model="cnn")
+                except Exception as cnn_error:
+                    log(f"CNN model failed: {cnn_error}")
+            
+            if not boxes:
+                error_msg = "No face detected in frame. Please position yourself clearly in front of the camera with good lighting."
+                log(f"No face detected in frame for trusted face addition (tried both HOG and CNN models)")
+                return False, error_msg
             
             if len(boxes) > 1:
-                log("Multiple faces detected - please ensure only one face is visible")
-                return False
+                error_msg = f"Multiple faces detected ({len(boxes)}). Please ensure only one person is visible in the camera."
+                log(f"Multiple faces detected ({len(boxes)}) - please ensure only one face is visible")
+                return False, error_msg
+            
+            log(f"Face detected at location: {boxes[0]}")
             
             encodings = face_recognition.face_encodings(rgb, boxes)
             if not encodings:
-                log("Could not generate face encoding")
-                return False
+                error_msg = "Could not generate face encoding from detected face. Try with better lighting or a clearer view."
+                log("Could not generate face encoding from detected face")
+                return False, error_msg
             
             encoding = encodings[0]
+            log(f"Generated face encoding with {len(encoding)} dimensions")
             
             # Check if this face is already trusted
             for trusted_face in self.trusted_faces:
                 distance = face_recognition.face_distance([trusted_face["encoding"]], encoding)[0]
                 if distance < 0.6:  # Same person threshold
-                    log(f"Face already exists as trusted user: {trusted_face['name']}")
-                    return False
+                    error_msg = f"This face is already registered as '{trusted_face['name']}'. Each person can only be added once."
+                    log(f"Face already exists as trusted user: {trusted_face['name']} (distance: {distance:.3f})")
+                    return False, error_msg
             
             # Add new trusted face
             new_trusted_face = {
@@ -1275,24 +1397,47 @@ class VisionWorker(threading.Thread):
             self.trusted_faces.append(new_trusted_face)
             self._save_trusted_faces()
             
-            log(f"Added trusted face: {name}")
-            return True
+            log(f"Successfully added trusted face: {name}")
+            return True, "Success"
             
         except Exception as e:
+            error_msg = f"Unexpected error occurred: {str(e)}"
             log(f"Error adding trusted face: {e}")
-            return False
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
+            return False, error_msg
 
     def remove_trusted_face(self, name):
-        """Remove a trusted face by name"""
-        original_count = len(self.trusted_faces)
-        self.trusted_faces = [face for face in self.trusted_faces if face["name"] != name]
-        
-        if len(self.trusted_faces) < original_count:
-            self._save_trusted_faces()
-            log(f"Removed trusted face: {name}")
-            return True
-        else:
-            log(f"Trusted face not found: {name}")
+        """Remove a trusted face by name with enhanced error handling"""
+        try:
+            original_count = len(self.trusted_faces)
+            
+            # Find the face to remove
+            face_to_remove = None
+            for face in self.trusted_faces:
+                if face["name"] == name:
+                    face_to_remove = face
+                    break
+            
+            if not face_to_remove:
+                log(f"Trusted face not found for removal: {name}")
+                return False
+            
+            # Remove the face
+            self.trusted_faces = [face for face in self.trusted_faces if face["name"] != name]
+            
+            if len(self.trusted_faces) < original_count:
+                self._save_trusted_faces()
+                log(f"Successfully removed trusted face: {name} (added on {face_to_remove.get('added_date', 'unknown date')})")
+                return True
+            else:
+                log(f"Failed to remove trusted face: {name} - list unchanged")
+                return False
+                
+        except Exception as e:
+            log(f"Error removing trusted face '{name}': {e}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
             return False
 
     def is_trusted_face(self, frame_bgr):
@@ -2215,6 +2360,260 @@ class SettingsWindow(QMainWindow):
         
         log(f"Settings saved - Auto-lock: {self.auto_lock_checkbox.isChecked()}, Delay: {self.delay_spinbox.value()}s, Grace: {self.grace_spinbox.value()}s, Performance: {self.performance_checkbox.isChecked()}")
         self.close()
+
+# ------------------- Trusted Faces Dialog -------------------
+
+class TrustedFacesDialog(QMainWindow):
+    def __init__(self, worker, parent=None):
+        super().__init__(parent)
+        self.worker = worker
+        self.setWindowTitle("Manage Trusted Faces")
+        self.setMinimumSize(500, 400)
+        self.setWindowFlags(Qt.Window)
+        
+        # Set window icon
+        icon_path = os.path.join(SCRIPT_DIR, "icon.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        
+        # Main widget and layout
+        main_widget = QWidget()
+        main_widget.setStyleSheet("background-color: #2b2b2b; color: #ffffff;")
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        
+        # Title
+        title_label = QLabel("👥 Trusted Faces Management")
+        title_label.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: #ffffff;
+                padding: 10px;
+                background-color: #404040;
+                border-radius: 5px;
+                margin-bottom: 10px;
+            }
+        """)
+        layout.addWidget(title_label)
+        
+        # Status label for operations feedback
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                padding: 8px;
+                background-color: #1e1e1e;
+                color: #ffffff;
+                border-radius: 5px;
+                font-weight: bold;
+                border: 1px solid #555;
+                margin-bottom: 5px;
+            }
+        """)
+        layout.addWidget(self.status_label)
+        
+        # List widget to show trusted faces
+        from PySide6.QtWidgets import QListWidget
+        
+        self.trusted_list = QListWidget()
+        self.trusted_list.setStyleSheet("""
+            QListWidget {
+                background-color: #1e1e1e;
+                color: #ffffff;
+                border: 1px solid #555;
+                border-radius: 5px;
+                padding: 5px;
+                font-size: 12px;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #333;
+            }
+            QListWidget::item:selected {
+                background-color: #4CAF50;
+                color: white;
+            }
+            QListWidget::item:hover {
+                background-color: #505050;
+            }
+        """)
+        layout.addWidget(self.trusted_list)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        button_style = """
+            QPushButton {
+                background-color: #404040;
+                color: #ffffff;
+                border: 1px solid #666;
+                padding: 10px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+                border: 1px solid #888;
+            }
+            QPushButton:pressed {
+                background-color: #303030;
+            }
+            QPushButton:disabled {
+                background-color: #2a2a2a;
+                color: #666;
+            }
+        """
+        
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.remove_btn = QPushButton("🗑️ Remove Selected")
+        self.close_btn = QPushButton("✅ Close")
+        
+        # Special styling for remove button
+        remove_style = """
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #c82333;
+                padding: 10px 15px;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+            QPushButton:pressed {
+                background-color: #bd2130;
+            }
+            QPushButton:disabled {
+                background-color: #666;
+                color: #999;
+            }
+        """
+        
+        self.refresh_btn.setStyleSheet(button_style)
+        self.remove_btn.setStyleSheet(remove_style)
+        self.close_btn.setStyleSheet(button_style)
+        
+        button_layout.addWidget(self.refresh_btn)
+        button_layout.addWidget(self.remove_btn)
+        button_layout.addStretch()
+        button_layout.addWidget(self.close_btn)
+        layout.addLayout(button_layout)
+        
+        # Connect buttons
+        self.refresh_btn.clicked.connect(self.refresh_list)
+        self.remove_btn.clicked.connect(self.remove_selected)
+        self.close_btn.clicked.connect(self.close)
+        
+        # Load initial data
+        self.refresh_list()
+    
+    def refresh_list(self):
+        """Refresh the list of trusted faces with enhanced feedback"""
+        try:
+            self.status_label.setText("🔄 Refreshing trusted faces list...")
+            self.trusted_list.clear()
+            
+            # Reload trusted faces from file to ensure we have latest data
+            self.worker.trusted_faces = self.worker._load_trusted_faces()
+            
+            if not self.worker.trusted_faces:
+                from PySide6.QtWidgets import QListWidgetItem
+                item = QListWidgetItem("📝 No trusted faces configured\n   Click 'Add Trusted Face' in the camera preview to add someone")
+                item.setData(Qt.UserRole, None)  # No data for this item
+                self.trusted_list.addItem(item)
+                self.remove_btn.setEnabled(False)
+                self.status_label.setText("📝 No trusted faces found")
+                return
+            
+            self.remove_btn.setEnabled(True)
+            
+            for i, trusted_face in enumerate(self.worker.trusted_faces, 1):
+                name = trusted_face["name"]
+                added_date = trusted_face.get("added_date", "Unknown date")
+                
+                # Create display text with numbering and better formatting
+                display_text = f"👤 {i}. {name}\n   📅 Added: {added_date}"
+                
+                from PySide6.QtWidgets import QListWidgetItem
+                item = QListWidgetItem(display_text)
+                item.setData(Qt.UserRole, trusted_face)  # Store face data
+                self.trusted_list.addItem(item)
+            
+            # Update status with count
+            count = len(self.worker.trusted_faces)
+            self.status_label.setText(f"✅ Loaded {count} trusted face{'s' if count != 1 else ''}")
+            log(f"Trusted faces dialog refreshed: {count} faces loaded")
+            
+        except Exception as e:
+            self.status_label.setText(f"❌ Error refreshing list: {str(e)}")
+            log(f"Error refreshing trusted faces list: {e}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
+    
+    def remove_selected(self):
+        """Remove the selected trusted face with enhanced error handling"""
+        current_item = self.trusted_list.currentItem()
+        if not current_item:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, 
+                "ℹ️ No Selection", 
+                "Please select a trusted face from the list to remove.\n\n"
+                "Click on a person's name in the list above, then try again."
+            )
+            return
+        
+        face_data = current_item.data(Qt.UserRole)
+        if not face_data:
+            return  # This is the "no trusted faces" item
+        
+        name = face_data["name"]
+        added_date = face_data.get("added_date", "Unknown date")
+        
+        # Enhanced confirmation dialog
+        from PySide6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self,
+            "🗑️ Confirm Removal",
+            f"Are you sure you want to remove this trusted face?\n\n"
+            f"👤 Name: {name}\n"
+            f"📅 Added: {added_date}\n\n"
+            f"⚠️ This action cannot be undone. The person will need to be re-added "
+            f"if you want to trust them again.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.status_label.setText(f"🗑️ Removing '{name}'...")
+            success = self.worker.remove_trusted_face(name)
+            if success:
+                remaining_count = len(self.worker.trusted_faces)
+                QMessageBox.information(
+                    self, 
+                    "✅ Success", 
+                    f"'{name}' has been successfully removed from trusted faces.\n\n"
+                    f"Remaining trusted faces: {remaining_count}"
+                )
+                self.refresh_list()
+                log(f"Trusted face removed via UI: {name}")
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "❌ Error", 
+                    f"Failed to remove '{name}' from trusted faces.\n\n"
+                    f"This might be due to:\n"
+                    f"• File permission issues\n"
+                    f"• The face was already removed\n"
+                    f"• System error\n\n"
+                    f"Please try refreshing the list and try again."
+                )
+                self.status_label.setText(f"❌ Failed to remove '{name}'")
+                # Refresh the list in case the data changed
+                self.refresh_list()
 
 # ---------------------- Main Application ----------------------
 
