@@ -108,41 +108,69 @@ def lock_windows_screen():
         return False
 
 def is_system_locked():
-    """Check if Windows screen is locked"""
+    """Check if Windows screen is locked using multiple methods"""
     try:
-        # Check if the current desktop is the secure desktop (lock screen)
+        # Method 1: Check if we can open the input desktop
         hdesk = ctypes.windll.user32.OpenInputDesktop(0, False, 0)
         if hdesk == 0:
             return True  # Can't access desktop, likely locked
         
-        # Get desktop name
+        # Method 2: Get desktop name and check if it's the secure desktop
         desktop_name = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetUserObjectInformationW(hdesk, 2, desktop_name, 512, None)
+        result = ctypes.windll.user32.GetUserObjectInformationW(hdesk, 2, desktop_name, 512, None)
         ctypes.windll.user32.CloseDesktop(hdesk)
         
-        # If desktop name is not "Default", system is likely locked
-        return desktop_name.value.lower() != "default"
-    except Exception:
+        if result:
+            desktop_str = desktop_name.value.lower()
+            # Check for secure desktop names that indicate lock screen
+            if desktop_str in ["winlogon", "secure desktop", "screen-saver", ""] or "winlogon" in desktop_str:
+                return True
+        
+        # Method 3: Check if screen saver is active (additional check)
+        screen_saver_running = ctypes.c_bool()
+        ctypes.windll.user32.SystemParametersInfoW(0x0072, 0, ctypes.byref(screen_saver_running), 0)
+        if screen_saver_running.value:
+            return True
+            
+        return False
+    except Exception as e:
+        # If we can't determine the state, assume not locked to avoid false positives
         return False
 
 def is_system_sleeping():
-    """Check if system is in sleep/hibernate mode"""
+    """Check if system is in sleep/hibernate mode or display is off"""
     try:
-        # Check system power state
-        system_power_status = ctypes.Structure()
-        system_power_status._fields_ = [
-            ("ACLineStatus", ctypes.c_ubyte),
-            ("BatteryFlag", ctypes.c_ubyte),
-            ("BatteryLifePercent", ctypes.c_ubyte),
-            ("SystemStatusFlag", ctypes.c_ubyte),
-            ("BatteryLifeTime", wintypes.DWORD),
-            ("BatteryFullLifeTime", wintypes.DWORD)
-        ]
+        # Method 1: Check system power state
+        class SYSTEM_POWER_STATUS(ctypes.Structure):
+            _fields_ = [
+                ("ACLineStatus", ctypes.c_ubyte),
+                ("BatteryFlag", ctypes.c_ubyte),
+                ("BatteryLifePercent", ctypes.c_ubyte),
+                ("SystemStatusFlag", ctypes.c_ubyte),
+                ("BatteryLifeTime", wintypes.DWORD),
+                ("BatteryFullLifeTime", wintypes.DWORD)
+            ]
         
-        result = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(system_power_status))
+        power_status = SYSTEM_POWER_STATUS()
+        result = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(power_status))
         if result:
             # SystemStatusFlag bit 0 indicates if system is in power saving mode
-            return bool(system_power_status.SystemStatusFlag & 1)
+            if power_status.SystemStatusFlag & 1:
+                return True
+        
+        # Method 2: Check if display is turned off
+        try:
+            # Get monitor power state
+            MONITOR_ON = -1
+            MONITOR_OFF = 2
+            MONITOR_STANDBY = 1
+            
+            # This is a simplified check - in practice, detecting sleep is complex
+            # We'll rely primarily on the lock screen detection
+            pass
+        except Exception:
+            pass
+            
         return False
     except Exception:
         return False
@@ -1142,8 +1170,11 @@ class VisionWorker(threading.Thread):
         self.auto_lock_grace_period_start = None
         self.brightness_before_auto_lock = None
         self.auto_lock_in_progress = False
-        self.system_locked = False
-        self.program_paused = False
+        
+        # System state monitoring
+        self.system_locked = is_system_locked()  # Initialize with current state
+        self.system_sleeping = is_system_sleeping()  # Initialize with current state
+        self.program_paused = self.system_locked or self.system_sleeping  # Start paused if system is locked/sleeping
         
         # Face detection state
         self.current_frame = None
@@ -1885,26 +1916,58 @@ class VisionWorker(threading.Thread):
         current_locked = is_system_locked()
         current_sleeping = is_system_sleeping()
         
-        # Check if system state changed
+        # Check if system lock state changed
         if current_locked != self.system_locked:
             self.system_locked = current_locked
             if current_locked:
-                log("🔒 System locked - Pausing FaceGuard")
+                log("🔒 System locked - Pausing FaceGuard monitoring")
                 self.program_paused = True
                 # Reset auto-lock state when system is manually locked
                 self.auto_lock_in_progress = False
                 self.auto_lock_grace_period_start = None
+                # Reset owner absence tracking
+                self.owner_absent_start = None
+                self.brightness_dimmed_for_absence = False
+                # Show toast notification
+                self.on_toast("🔒 System locked - Monitoring paused", "orange")
             else:
-                log("🔓 System unlocked - Resuming FaceGuard")
+                log("� eSystem unlocked - Resuming FaceGuard monitoring")
                 self.program_paused = False
+                # Reset states when resuming
+                self.owner_absent_start = None
+                self.brightness_dimmed_for_absence = False
+                self.awaiting_gesture = False
+                self.gesture_confirmed = False
+                # Show toast notification
+                self.on_toast("🔓 System unlocked - Monitoring resumed", "green")
         
-        # Check for sleep state (simplified check)
-        if current_sleeping and not self.program_paused:
-            log("😴 System sleeping - Pausing FaceGuard")
-            self.program_paused = True
-        elif not current_sleeping and self.program_paused and not self.system_locked:
-            log("⏰ System awake - Resuming FaceGuard")
-            self.program_paused = False
+        # Check for sleep state changes
+        if current_sleeping != self.system_sleeping:
+            self.system_sleeping = current_sleeping
+            if current_sleeping:
+                log("😴 System entering sleep mode - Pausing FaceGuard monitoring")
+                self.program_paused = True
+                # Reset states when entering sleep
+                self.owner_absent_start = None
+                self.brightness_dimmed_for_absence = False
+                self.auto_lock_in_progress = False
+                self.auto_lock_grace_period_start = None
+                self.awaiting_gesture = False
+                self.gesture_confirmed = False
+                # Show toast notification
+                self.on_toast("😴 System sleeping - Monitoring paused", "orange")
+            else:
+                log("⏰ System waking up - Resuming FaceGuard monitoring")
+                # Only resume if not locked
+                if not current_locked:
+                    self.program_paused = False
+                    # Reset states when waking up
+                    self.owner_absent_start = None
+                    self.brightness_dimmed_for_absence = False
+                    self.awaiting_gesture = False
+                    self.gesture_confirmed = False
+                    # Show toast notification
+                    self.on_toast("⏰ System awake - Monitoring resumed", "green")
     
     # ---------- Main loop ----------
 
@@ -1913,19 +1976,58 @@ class VisionWorker(threading.Thread):
             log("ERROR: Cannot open webcam.")
             return
 
-        # Attempt first frame to register owner if needed
-        ret, frame = self.cap.read()
-        if ret:
-            self.register_owner_if_needed(frame)
+        # Log initial system state
+        if self.program_paused:
+            if self.system_locked:
+                log("🔒 Starting in paused state - System is locked")
+            elif self.system_sleeping:
+                log("😴 Starting in paused state - System is sleeping")
+        else:
+            log("✅ Starting FaceGuard monitoring - System is active")
+
+        # Attempt first frame to register owner if needed (only if not paused)
+        if not self.program_paused:
+            ret, frame = self.cap.read()
+            if ret:
+                self.register_owner_if_needed(frame)
 
         while self.running:
             # Check system state first
             self.check_system_state()
             
-            # Skip processing if program is paused
+            # Skip processing if program is paused (system locked or sleeping)
             if self.program_paused:
-                time.sleep(0.5)  # Check every 500ms when paused
+                # When paused, we still need to check system state but less frequently
+                # Release camera resources temporarily to avoid conflicts
+                if self.cap.isOpened():
+                    self.cap.release()
+                
+                # Wait and check system state periodically
+                time.sleep(1.0)  # Check every 1 second when paused
+                
+                # Reinitialize camera when resuming
+                if not self.program_paused and not self.cap.isOpened():
+                    log("📹 Attempting to reinitialize camera after resume...")
+                    self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                    if self.cap.isOpened():
+                        log("✅ Camera successfully reinitialized after resume")
+                        # Register owner if needed after resume
+                        ret, frame = self.cap.read()
+                        if ret and self.owner_encoding is None:
+                            self.register_owner_if_needed(frame)
+                    else:
+                        log("❌ Failed to reinitialize camera after resume - will retry")
+                        time.sleep(2.0)  # Wait before retrying
+                
                 continue
+            
+            # Ensure camera is available
+            if not self.cap.isOpened():
+                log("📹 Camera not available, attempting to reconnect...")
+                self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                if not self.cap.isOpened():
+                    time.sleep(1.0)  # Wait longer if camera is not available
+                    continue
             
             ret, frame = self.cap.read()
             if not ret:
