@@ -27,7 +27,7 @@ from PySide6.QtCore import Qt, QTimer, QSize, Signal, QObject, QThread
 from PySide6.QtGui import QIcon, QAction, QKeySequence, QPixmap, QImage
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QSystemTrayIcon, QMenu,
-    QTextEdit, QMainWindow, QDockWidget, QHBoxLayout, QPushButton, QCheckBox
+    QTextEdit, QMainWindow, QDockWidget, QHBoxLayout, QPushButton, QCheckBox, QSpinBox
 )
 
 # Global hotkeys
@@ -36,6 +36,7 @@ import keyboard
 # Windows lock screen functionality
 import ctypes
 import ctypes.wintypes
+from ctypes import wintypes
 
 # Use current script directory instead of user home
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +50,7 @@ os.makedirs(UNKNOWN_FACES_DIR, exist_ok=True)
 os.makedirs(LOGS_DIR, exist_ok=True)
 
 ENCODING_PATH = os.path.join(APP_DIR, "user_face_encoding.json")
+TRUSTED_FACES_PATH = os.path.join(APP_DIR, "trusted_faces.json")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 LOG_FILE_PATH = os.path.join(LOGS_DIR, f"face_guard_{time.strftime('%Y%m%d')}.log")
 
@@ -68,6 +70,8 @@ def load_json(path, default=None):
 DEFAULT_SETTINGS = {
     "face_recognition_sensitivity": 0.48,  # Lower = more strict, Higher = more lenient
     "auto_lock_enabled": False,
+    "owner_absence_delay": 3.0,  # seconds before dimming screen when owner absent
+    "auto_lock_grace_period": 30.0,  # seconds grace period before locking screen
     "status_display_duration": 5.0,  # seconds
     "brightness_before_absence": 100,  # Store original brightness
     "performance_mode": True,
@@ -101,6 +105,46 @@ def lock_windows_screen():
         return True
     except Exception as e:
         log(f"Failed to lock screen: {e}")
+        return False
+
+def is_system_locked():
+    """Check if Windows screen is locked"""
+    try:
+        # Check if the current desktop is the secure desktop (lock screen)
+        hdesk = ctypes.windll.user32.OpenInputDesktop(0, False, 0)
+        if hdesk == 0:
+            return True  # Can't access desktop, likely locked
+        
+        # Get desktop name
+        desktop_name = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetUserObjectInformationW(hdesk, 2, desktop_name, 512, None)
+        ctypes.windll.user32.CloseDesktop(hdesk)
+        
+        # If desktop name is not "Default", system is likely locked
+        return desktop_name.value.lower() != "default"
+    except Exception:
+        return False
+
+def is_system_sleeping():
+    """Check if system is in sleep/hibernate mode"""
+    try:
+        # Check system power state
+        system_power_status = ctypes.Structure()
+        system_power_status._fields_ = [
+            ("ACLineStatus", ctypes.c_ubyte),
+            ("BatteryFlag", ctypes.c_ubyte),
+            ("BatteryLifePercent", ctypes.c_ubyte),
+            ("SystemStatusFlag", ctypes.c_ubyte),
+            ("BatteryLifeTime", wintypes.DWORD),
+            ("BatteryFullLifeTime", wintypes.DWORD)
+        ]
+        
+        result = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(system_power_status))
+        if result:
+            # SystemStatusFlag bit 0 indicates if system is in power saving mode
+            return bool(system_power_status.SystemStatusFlag & 1)
+        return False
+    except Exception:
         return False
 
 def cosine_similarity(a, b, eps=1e-8):
@@ -499,6 +543,41 @@ class CameraPreview(QMainWindow):
         button_layout3.addWidget(self.calibrate_btn)
         layout.addLayout(button_layout3)
         
+        # Trusted faces management buttons
+        button_layout4 = QHBoxLayout()
+        self.add_trusted_btn = QPushButton("👥 Add Trusted Face")
+        self.manage_trusted_btn = QPushButton("📋 Manage Trusted Faces")
+        
+        # Apply dark theme to trusted face buttons
+        trusted_button_style = """
+            QPushButton {
+                background-color: #6366F1;
+                color: white;
+                font-weight: bold;
+                border: 1px solid #4F46E5;
+                padding: 8px 12px;
+                border-radius: 5px;
+                min-height: 20px;
+            }
+            QPushButton:hover {
+                background-color: #4F46E5;
+            }
+            QPushButton:pressed {
+                background-color: #3730A3;
+            }
+            QPushButton:disabled {
+                background-color: #666;
+                color: #999;
+            }
+        """
+        
+        self.add_trusted_btn.setStyleSheet(trusted_button_style)
+        self.manage_trusted_btn.setStyleSheet(trusted_button_style)
+        
+        button_layout4.addWidget(self.add_trusted_btn)
+        button_layout4.addWidget(self.manage_trusted_btn)
+        layout.addLayout(button_layout4)
+        
         # Face Recognition Sensitivity Controls
         sensitivity_layout = QHBoxLayout()
         
@@ -510,7 +589,18 @@ class CameraPreview(QMainWindow):
         self.sensitivity_slider = QSlider(Qt.Horizontal)
         self.sensitivity_slider.setMinimum(50)  # 50% minimum
         self.sensitivity_slider.setMaximum(95)  # 95% maximum
-        self.sensitivity_slider.setValue(75)    # 75% default
+        # Load current sensitivity from settings and convert tolerance back to percentage
+        # Load settings directly since worker may not be set yet
+        try:
+            settings = load_settings()
+            current_tolerance = settings.get("face_recognition_sensitivity", 0.48)
+        except:
+            current_tolerance = 0.48
+        # Convert tolerance back to percentage: tolerance = 0.8 - (percentage / 100.0) * 0.5
+        # So: percentage = (0.8 - tolerance) * 100.0 / 0.5 = (0.8 - tolerance) * 200
+        current_percentage = int((0.8 - current_tolerance) * 200)
+        current_percentage = max(50, min(95, current_percentage))  # Clamp to valid range
+        self.sensitivity_slider.setValue(current_percentage)
         self.sensitivity_slider.setStyleSheet("""
             QSlider::groove:horizontal {
                 border: 1px solid #666;
@@ -533,7 +623,7 @@ class CameraPreview(QMainWindow):
         self.sensitivity_spinbox = QSpinBox()
         self.sensitivity_spinbox.setMinimum(50)
         self.sensitivity_spinbox.setMaximum(95)
-        self.sensitivity_spinbox.setValue(75)
+        self.sensitivity_spinbox.setValue(current_percentage)
         self.sensitivity_spinbox.setSuffix("%")
         self.sensitivity_spinbox.setStyleSheet("""
             QSpinBox {
@@ -543,6 +633,54 @@ class CameraPreview(QMainWindow):
                 padding: 5px;
                 border-radius: 3px;
                 font-weight: bold;
+                font-size: 12px;
+                min-height: 24px;
+            }
+            QSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 24px;
+                height: 12px;
+                border-left: 1px solid #666;
+                background-color: #505050;
+                border-radius: 0px;
+            }
+            QSpinBox::up-button:hover {
+                background-color: #606060;
+            }
+            QSpinBox::up-button:pressed {
+                background-color: #707070;
+            }
+            QSpinBox::up-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 6px solid white;
+                width: 8px;
+                height: 6px;
+            }
+            QSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 24px;
+                height: 12px;
+                border-left: 1px solid #666;
+                background-color: #505050;
+                border-radius: 0px;
+            }
+            QSpinBox::down-button:hover {
+                background-color: #606060;
+            }
+            QSpinBox::down-button:pressed {
+                background-color: #707070;
+            }
+            QSpinBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid white;
+                width: 8px;
+                height: 6px;
             }
         """)
         
@@ -587,6 +725,11 @@ class CameraPreview(QMainWindow):
         if self.preview_thread:
             self.preview_thread.stop_preview()
         
+        # Load performance mode from settings
+        self.performance_mode = worker.settings.get("performance_mode", True)
+        mode_text = "ON" if self.performance_mode else "OFF"
+        self.performance_btn.setText(f"Performance Mode: {mode_text}")
+        
         # Create new optimized preview thread
         self.preview_thread = CameraPreviewThread()
         self.preview_thread.set_worker(worker)
@@ -624,7 +767,13 @@ class CameraPreview(QMainWindow):
         if self.preview_thread:
             self.preview_thread.set_performance_mode(self.performance_mode)
         
-        log(f"📊 Performance mode: {mode_text} (Preview FPS: {15 if self.performance_mode else 30})")
+        # Save to settings file and update worker
+        if self.worker:
+            self.worker.settings["performance_mode"] = self.performance_mode
+            save_settings(self.worker.settings)
+            log(f"📊 Performance mode: {mode_text} (Preview FPS: {15 if self.performance_mode else 30}) - Saved to settings")
+        else:
+            log(f"📊 Performance mode: {mode_text} (Preview FPS: {15 if self.performance_mode else 30})")
     
     def reset_owner_face(self):
         """Reset the owner face encoding"""
@@ -723,7 +872,12 @@ class CameraPreview(QMainWindow):
             # 75% = 0.48 tolerance, 50% = 0.6 tolerance, 95% = 0.3 tolerance
             tolerance = 0.8 - (value / 100.0) * 0.5  # Maps 50-95% to 0.55-0.325 tolerance
             self.worker.face_recognition_tolerance = tolerance
-            log(f"Face recognition sensitivity set to {value}% (tolerance: {tolerance:.3f})")
+            
+            # Save the tolerance value to settings
+            self.worker.settings["face_recognition_sensitivity"] = tolerance
+            save_settings(self.worker.settings)
+            
+            log(f"Face recognition sensitivity set to {value}% (tolerance: {tolerance:.3f}) - Saved to settings")
             self.status_label.setText(f"Status: Face recognition sensitivity: {value}%")
     
     def view_unknown_faces(self):
@@ -877,6 +1031,15 @@ class VisionWorker(threading.Thread):
         
         # Auto-lock functionality
         self.auto_lock_enabled = self.settings.get("auto_lock_enabled", False)
+        self.owner_absence_delay = self.settings.get("owner_absence_delay", 3.0)
+        self.auto_lock_grace_period = self.settings.get("auto_lock_grace_period", 30.0)
+        
+        # Enhanced auto-lock state
+        self.auto_lock_grace_period_start = None
+        self.brightness_before_auto_lock = None
+        self.auto_lock_in_progress = False
+        self.system_locked = False
+        self.program_paused = False
         
         # Face detection state
         self.current_frame = None
@@ -916,6 +1079,10 @@ class VisionWorker(threading.Thread):
         # Adaptive thresholds
         self.nod_threshold = 12.0
         self.shake_threshold = 15.0
+        
+        # Trusted faces system
+        self.trusted_faces = self._load_trusted_faces()
+        self.pending_trusted_face = None  # For adding new trusted faces
 
     # ---------- Face registration & matching ----------
 
@@ -1031,6 +1198,131 @@ class VisionWorker(threading.Thread):
             face_box = [(top, right, bottom, left)]
             
             return sim > 0.995, face_box  # tight threshold; adjust if needed
+
+    # ---------- Trusted faces management ----------
+
+    def _load_trusted_faces(self):
+        """Load trusted faces from file"""
+        data = load_json(TRUSTED_FACES_PATH, {"faces": []})
+        trusted_faces = []
+        
+        if HAS_FACE_REC and "faces" in data:
+            for face_data in data["faces"]:
+                if "encoding" in face_data and "name" in face_data:
+                    encoding = np.array(face_data["encoding"], dtype=np.float32)
+                    trusted_faces.append({
+                        "name": face_data["name"],
+                        "encoding": encoding,
+                        "added_date": face_data.get("added_date", "Unknown")
+                    })
+            log(f"Loaded {len(trusted_faces)} trusted faces")
+        
+        return trusted_faces
+
+    def _save_trusted_faces(self):
+        """Save trusted faces to file"""
+        data = {"faces": []}
+        
+        for face in self.trusted_faces:
+            data["faces"].append({
+                "name": face["name"],
+                "encoding": face["encoding"].tolist(),
+                "added_date": face["added_date"]
+            })
+        
+        save_json(TRUSTED_FACES_PATH, data)
+        log(f"Saved {len(self.trusted_faces)} trusted faces")
+
+    def add_trusted_face(self, frame_bgr, name):
+        """Add a new trusted face from the current frame"""
+        if not HAS_FACE_REC:
+            log("Cannot add trusted face - face_recognition library not available")
+            return False
+        
+        try:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            boxes = face_recognition.face_locations(rgb, model="hog")
+            
+            if not boxes:
+                log("No face detected in frame for trusted face addition")
+                return False
+            
+            if len(boxes) > 1:
+                log("Multiple faces detected - please ensure only one face is visible")
+                return False
+            
+            encodings = face_recognition.face_encodings(rgb, boxes)
+            if not encodings:
+                log("Could not generate face encoding")
+                return False
+            
+            encoding = encodings[0]
+            
+            # Check if this face is already trusted
+            for trusted_face in self.trusted_faces:
+                distance = face_recognition.face_distance([trusted_face["encoding"]], encoding)[0]
+                if distance < 0.6:  # Same person threshold
+                    log(f"Face already exists as trusted user: {trusted_face['name']}")
+                    return False
+            
+            # Add new trusted face
+            new_trusted_face = {
+                "name": name,
+                "encoding": encoding,
+                "added_date": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            self.trusted_faces.append(new_trusted_face)
+            self._save_trusted_faces()
+            
+            log(f"Added trusted face: {name}")
+            return True
+            
+        except Exception as e:
+            log(f"Error adding trusted face: {e}")
+            return False
+
+    def remove_trusted_face(self, name):
+        """Remove a trusted face by name"""
+        original_count = len(self.trusted_faces)
+        self.trusted_faces = [face for face in self.trusted_faces if face["name"] != name]
+        
+        if len(self.trusted_faces) < original_count:
+            self._save_trusted_faces()
+            log(f"Removed trusted face: {name}")
+            return True
+        else:
+            log(f"Trusted face not found: {name}")
+            return False
+
+    def is_trusted_face(self, frame_bgr):
+        """Check if any face in the frame is a trusted face"""
+        if not HAS_FACE_REC or not self.trusted_faces:
+            return False, None
+        
+        try:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            boxes = face_recognition.face_locations(rgb, model="hog")
+            
+            if not boxes:
+                return False, None
+            
+            encodings = face_recognition.face_encodings(rgb, boxes)
+            if not encodings:
+                return False, None
+            
+            # Check each detected face against trusted faces
+            for encoding in encodings:
+                for trusted_face in self.trusted_faces:
+                    distance = face_recognition.face_distance([trusted_face["encoding"]], encoding)[0]
+                    if distance < 0.6:  # Trusted face recognition threshold
+                        return True, trusted_face["name"]
+            
+            return False, None
+            
+        except Exception as e:
+            log(f"Error checking trusted faces: {e}")
+            return False, None
 
     # ---------- Brightness helpers ----------
 
@@ -1441,6 +1733,34 @@ class VisionWorker(threading.Thread):
         
         return is_nod, is_shake
 
+    # ---------- System State Monitoring ----------
+    
+    def check_system_state(self):
+        """Check system state and pause/resume program accordingly"""
+        current_locked = is_system_locked()
+        current_sleeping = is_system_sleeping()
+        
+        # Check if system state changed
+        if current_locked != self.system_locked:
+            self.system_locked = current_locked
+            if current_locked:
+                log("🔒 System locked - Pausing FaceGuard")
+                self.program_paused = True
+                # Reset auto-lock state when system is manually locked
+                self.auto_lock_in_progress = False
+                self.auto_lock_grace_period_start = None
+            else:
+                log("🔓 System unlocked - Resuming FaceGuard")
+                self.program_paused = False
+        
+        # Check for sleep state (simplified check)
+        if current_sleeping and not self.program_paused:
+            log("😴 System sleeping - Pausing FaceGuard")
+            self.program_paused = True
+        elif not current_sleeping and self.program_paused and not self.system_locked:
+            log("⏰ System awake - Resuming FaceGuard")
+            self.program_paused = False
+    
     # ---------- Main loop ----------
 
     def run(self):
@@ -1454,6 +1774,14 @@ class VisionWorker(threading.Thread):
             self.register_owner_if_needed(frame)
 
         while self.running:
+            # Check system state first
+            self.check_system_state()
+            
+            # Skip processing if program is paused
+            if self.program_paused:
+                time.sleep(0.5)  # Check every 500ms when paused
+                continue
+            
             ret, frame = self.cap.read()
             if not ret:
                 time.sleep(0.02)
@@ -1495,15 +1823,29 @@ class VisionWorker(threading.Thread):
             if self.calibration_mode:
                 self.check_gesture_calibration()
 
-            # Owner presence-based brightness control
+            # Enhanced owner presence-based control with auto-lock
             if owner_here:
-                # Owner is present
-                if self.owner_absent_start is not None:
+                # Owner is present - reset all absence states
+                if self.owner_absent_start is not None or self.auto_lock_in_progress:
                     # Owner just returned
-                    log("Owner returned → restoring brightness")
-                    self.restore_brightness()
+                    log("Owner returned → restoring system")
+                    log(f"DEBUG: auto_lock_in_progress={self.auto_lock_in_progress}, brightness_before_auto_lock={self.brightness_before_auto_lock}")
+                    
+                    # Restore brightness from the correct source
+                    if self.auto_lock_in_progress and self.brightness_before_auto_lock is not None:
+                        # In auto-lock mode, restore from brightness_before_auto_lock
+                        log(f"Restoring brightness from auto-lock storage: {self.brightness_before_auto_lock}%")
+                        self.set_brightness(self.brightness_before_auto_lock)
+                    else:
+                        # Standard mode, restore from settings
+                        log("Using standard brightness restoration")
+                        self.restore_brightness()
+                    
                     self.brightness_dimmed_for_absence = False
                     self.owner_absent_start = None
+                    self.auto_lock_in_progress = False
+                    self.auto_lock_grace_period_start = None
+                    self.brightness_before_auto_lock = None
                     self.on_toast("✅ Owner returned — System restored", "green")
             else:
                 # Owner is not present
@@ -1511,30 +1853,74 @@ class VisionWorker(threading.Thread):
                     # Owner just left
                     self.owner_absent_start = now
                     log("Owner left camera view")
-                    log("DEBUG: Calling toast for owner left")
-                    self.on_toast("⚠️ Owner left camera view — Screen will dim in 3 seconds", "orange")
-                elif not self.brightness_dimmed_for_absence and (now - self.owner_absent_start) > 3.0:
-                    # Owner has been absent for 3 seconds, store current brightness then dim to 0
-                    log("Owner absent for 3 seconds → storing current brightness and dimming to 0%")
-                    self.store_current_brightness()  # Store current brightness before dimming
-                    self.set_brightness(0)
-                    self.brightness_dimmed_for_absence = True
-                    self.on_toast("Owner absent — Brightness dimmed to 0%", "red")
+                    if self.auto_lock_enabled:
+                        self.on_toast("⚠️ Owner left — Auto-lock sequence starting", "orange")
+                    else:
+                        self.on_toast(f"⚠️ Owner left camera view — Screen will dim in {int(self.owner_absence_delay)} seconds", "orange")
+                elif not self.brightness_dimmed_for_absence and (now - self.owner_absent_start) > self.owner_absence_delay:
+                    # Owner has been absent for 3 seconds
+                    if self.auto_lock_enabled and not self.auto_lock_in_progress:
+                        # Start enhanced auto-lock sequence
+                        log(f"Owner absent for {self.owner_absence_delay} seconds → starting auto-lock sequence ({self.auto_lock_grace_period}s grace period)")
+                        self.brightness_before_auto_lock = self._get_current_brightness()
+                        self.set_brightness(0)
+                        self.brightness_dimmed_for_absence = True
+                        self.auto_lock_in_progress = True
+                        self.auto_lock_grace_period_start = now
+                        self.on_toast(f"🔒 Auto-lock active — {int(self.auto_lock_grace_period)} seconds until screen lock", "red")
+                    else:
+                        # Standard behavior (no auto-lock)
+                        log(f"Owner absent for {self.owner_absence_delay} seconds → storing current brightness and dimming to 0%")
+                        self.store_current_brightness()
+                        self.set_brightness(0)
+                        self.brightness_dimmed_for_absence = True
+                        self.on_toast("Owner absent — Brightness dimmed to 0%", "red")
+                elif self.auto_lock_in_progress and self.auto_lock_grace_period_start is not None:
+                    # Check if 30-second grace period has elapsed
+                    if (now - self.auto_lock_grace_period_start) > self.auto_lock_grace_period:
+                        # Grace period expired - restore brightness and lock screen
+                        log("Auto-lock grace period expired → restoring brightness and locking screen")
+                        if self.brightness_before_auto_lock is not None:
+                            self.set_brightness(self.brightness_before_auto_lock)
+                        else:
+                            self.restore_brightness()
+                        
+                        # Lock the screen
+                        if lock_windows_screen():
+                            self.on_toast("🔒 Screen locked — Owner absent too long", "red")
+                        else:
+                            self.on_toast("❌ Failed to lock screen", "red")
+                        
+                        # Reset auto-lock state
+                        self.auto_lock_in_progress = False
+                        self.auto_lock_grace_period_start = None
+                        self.brightness_before_auto_lock = None
+                        self.brightness_dimmed_for_absence = False
+                        self.owner_absent_start = None
 
             # Unknown face handling (only if there are faces but owner is not present)
             if face_boxes and not owner_here:
-                # Save unknown face image
-                self.save_unknown_face(frame, face_boxes)
+                # Check if any detected face is trusted
+                is_trusted, trusted_name = self.is_trusted_face(frame)
                 
-                # Only trigger gesture confirmation if we weren't already waiting
-                if not self.awaiting_gesture and not self.gesture_test_mode and (now - self.last_unknown_ts) > 2.0:
-                    self.last_unknown_ts = now
-                    self.awaiting_gesture = True
-                    self.gesture_deadline = now + 6.0  # 6 seconds to confirm
-                    log("Unknown face detected → awaiting gesture confirmation.")
-                    log("DEBUG: Calling toast for unknown face detected")
-                    self.on_unknown_face()
-                    self.on_toast("🚨 UNKNOWN FACE DETECTED — Nod twice to dim, Shake to cancel", "red")
+                if is_trusted:
+                    # Trusted face detected - no alert needed
+                    log(f"Trusted face detected: {trusted_name}")
+                    # Don't dim brightness or show alerts for trusted faces
+                else:
+                    # Unknown face detected - proceed with normal security measures
+                    # Save unknown face image
+                    self.save_unknown_face(frame, face_boxes)
+                    
+                    # Only trigger gesture confirmation if we weren't already waiting
+                    if not self.awaiting_gesture and not self.gesture_test_mode and (now - self.last_unknown_ts) > 2.0:
+                        self.last_unknown_ts = now
+                        self.awaiting_gesture = True
+                        self.gesture_deadline = now + 6.0  # 6 seconds to confirm
+                        log("Unknown face detected → awaiting gesture confirmation.")
+                        log("DEBUG: Calling toast for unknown face detected")
+                        self.on_unknown_face()
+                        self.on_toast("🚨 UNKNOWN FACE DETECTED — Nod twice to dim, Shake to cancel", "red")
 
             # If awaiting gesture, evaluate nod/shake (but not during gesture test)
             if self.awaiting_gesture and not self.gesture_test_mode:
@@ -1573,7 +1959,7 @@ class SettingsWindow(QMainWindow):
         super().__init__()
         self.worker = worker
         self.setWindowTitle("FaceGuard • Settings")
-        self.setFixedSize(400, 300)
+        self.setFixedSize(450, 380)
         self.setWindowFlags(Qt.Window)
         
         # Dark theme styling
@@ -1639,6 +2025,150 @@ class SettingsWindow(QMainWindow):
         self.auto_lock_checkbox.setToolTip("Automatically lock Windows screen when owner face is not detected")
         layout.addWidget(self.auto_lock_checkbox)
         
+        # Auto-lock timing settings
+        timing_layout = QVBoxLayout()
+        timing_layout.setContentsMargins(20, 0, 0, 0)  # Indent these controls
+        
+        # Owner absence delay
+        delay_layout = QHBoxLayout()
+        delay_label = QLabel("⏱️ Screen dim delay:")
+        delay_label.setToolTip("Seconds to wait before dimming screen when owner leaves")
+        self.delay_spinbox = QSpinBox()
+        self.delay_spinbox.setRange(1, 60)
+        self.delay_spinbox.setSuffix(" seconds")
+        self.delay_spinbox.setStyleSheet("""
+            QSpinBox {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #606060;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 12px;
+                min-height: 24px;
+            }
+            QSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 24px;
+                height: 12px;
+                border-left: 1px solid #606060;
+                background-color: #505050;
+                border-radius: 0px;
+            }
+            QSpinBox::up-button:hover {
+                background-color: #606060;
+            }
+            QSpinBox::up-button:pressed {
+                background-color: #707070;
+            }
+            QSpinBox::up-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 6px solid white;
+                width: 8px;
+                height: 6px;
+            }
+            QSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 24px;
+                height: 12px;
+                border-left: 1px solid #606060;
+                background-color: #505050;
+                border-radius: 0px;
+            }
+            QSpinBox::down-button:hover {
+                background-color: #606060;
+            }
+            QSpinBox::down-button:pressed {
+                background-color: #707070;
+            }
+            QSpinBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid white;
+                width: 8px;
+                height: 6px;
+            }
+        """)
+        delay_layout.addWidget(delay_label)
+        delay_layout.addWidget(self.delay_spinbox)
+        delay_layout.addStretch()
+        timing_layout.addLayout(delay_layout)
+        
+        # Auto-lock grace period
+        grace_layout = QHBoxLayout()
+        grace_label = QLabel("🔒 Lock grace period:")
+        grace_label.setToolTip("Seconds to wait before locking screen after dimming")
+        self.grace_spinbox = QSpinBox()
+        self.grace_spinbox.setRange(5, 300)
+        self.grace_spinbox.setSuffix(" seconds")
+        self.grace_spinbox.setStyleSheet("""
+            QSpinBox {
+                background-color: #404040;
+                color: white;
+                border: 1px solid #606060;
+                padding: 4px;
+                border-radius: 3px;
+                font-size: 12px;
+                min-height: 24px;
+            }
+            QSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 24px;
+                height: 12px;
+                border-left: 1px solid #606060;
+                background-color: #505050;
+                border-radius: 0px;
+            }
+            QSpinBox::up-button:hover {
+                background-color: #606060;
+            }
+            QSpinBox::up-button:pressed {
+                background-color: #707070;
+            }
+            QSpinBox::up-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 6px solid white;
+                width: 8px;
+                height: 6px;
+            }
+            QSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 24px;
+                height: 12px;
+                border-left: 1px solid #606060;
+                background-color: #505050;
+                border-radius: 0px;
+            }
+            QSpinBox::down-button:hover {
+                background-color: #606060;
+            }
+            QSpinBox::down-button:pressed {
+                background-color: #707070;
+            }
+            QSpinBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid white;
+                width: 8px;
+                height: 6px;
+            }
+        """)
+        grace_layout.addWidget(grace_label)
+        grace_layout.addWidget(self.grace_spinbox)
+        grace_layout.addStretch()
+        timing_layout.addLayout(grace_layout)
+        
+        layout.addLayout(timing_layout)
+        
         # Performance mode checkbox
         self.performance_checkbox = QCheckBox("⚡ Performance mode (faster detection)")
         self.performance_checkbox.setToolTip("Enable optimized detection for better performance")
@@ -1666,15 +2196,24 @@ class SettingsWindow(QMainWindow):
         """Load current settings into the UI"""
         settings = self.worker.settings
         self.auto_lock_checkbox.setChecked(settings.get("auto_lock_enabled", False))
+        self.delay_spinbox.setValue(int(settings.get("owner_absence_delay", 3.0)))
+        self.grace_spinbox.setValue(int(settings.get("auto_lock_grace_period", 30.0)))
         self.performance_checkbox.setChecked(settings.get("performance_mode", True))
     
     def save_settings(self):
         """Save settings and close window"""
         self.worker.settings["auto_lock_enabled"] = self.auto_lock_checkbox.isChecked()
+        self.worker.settings["owner_absence_delay"] = float(self.delay_spinbox.value())
+        self.worker.settings["auto_lock_grace_period"] = float(self.grace_spinbox.value())
         self.worker.settings["performance_mode"] = self.performance_checkbox.isChecked()
         save_settings(self.worker.settings)
         
-        log(f"Settings saved - Auto-lock: {self.auto_lock_checkbox.isChecked()}, Performance: {self.performance_checkbox.isChecked()}")
+        # Update worker settings immediately
+        self.worker.auto_lock_enabled = self.worker.settings["auto_lock_enabled"]
+        self.worker.owner_absence_delay = self.worker.settings["owner_absence_delay"]
+        self.worker.auto_lock_grace_period = self.worker.settings["auto_lock_grace_period"]
+        
+        log(f"Settings saved - Auto-lock: {self.auto_lock_checkbox.isChecked()}, Delay: {self.delay_spinbox.value()}s, Grace: {self.grace_spinbox.value()}s, Performance: {self.performance_checkbox.isChecked()}")
         self.close()
 
 # ---------------------- Main Application ----------------------
